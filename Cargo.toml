@@ -35,6 +35,7 @@ cc = "1.0.83"
 cmake = "0.1.49"
 
 [dependencies]
+skymrp_dynarmic_wrapper = { path = "src/cpu/dynarmic_wrapper" }
 skymrp_version = { path = "src/version" }
 # skymrp_loader = { path = "src/mrp"}
 libc = "0.2.180"

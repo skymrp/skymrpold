@@ -428,6 +428,14 @@ impl Mem {
         self.regions[0].host_base.as_ptr().cast()
     }
 
+    pub fn direct_memory_access_base(&self) -> VAddr {
+        self.regions[0].guest_base
+    }
+
+    pub fn direct_memory_access_len(&self) -> GuestUSize {
+        self.regions[0].len
+    }
+
     fn find_region(&self, addr: VAddr, count: GuestUSize) -> Option<&MemRegion> {
         self.regions
             .iter()

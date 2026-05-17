@@ -90,7 +90,7 @@ fn print_memory_string(uc: *mut c_void, mut addr: u32) {
         print!("{}", value as char);
         addr = addr.wrapping_add(1);
     }
-    println!();
+    echo!();
 }
 
 fn print_prompt(uc: *mut c_void, address: u64, size: u32) {
@@ -139,15 +139,15 @@ fn execute_command(uc: *mut c_void, command: &str, pc: u32, size: u32) -> bool {
     } else if command.starts_with("brkn") {
         let addr = pc.wrapping_add(size);
         BRK_ADDRESS.store(addr, Ordering::Relaxed);
-        println!("-------------> brkn 0x{addr:X}");
+        log!("-------------> brkn 0x{addr:X}");
     } else if command.starts_with("brklr") {
         let addr = read_reg(uc, RegisterARM::LR);
         BRK_ADDRESS.store(addr, Ordering::Relaxed);
-        println!("-------------> brklr 0x{addr:X}");
+        log!("-------------> brklr 0x{addr:X}");
     } else if command.starts_with("brk") {
         let addr = to_u32(&command);
         BRK_ADDRESS.store(addr, Ordering::Relaxed);
-        println!("-------------> brk 0x{addr:X}");
+        log!("-------------> brk 0x{addr:X}");
     } else if command.starts_with("=0x") {
         print_memory_string(uc, to_u32(&command));
     } else if command.starts_with("0x") {
@@ -156,18 +156,18 @@ fn execute_command(uc: *mut c_void, command: &str, pc: u32, size: u32) -> bool {
             let value = to_u32(right);
             let err = unicorn::mem_write_u32(uc, addr as u64, value);
             if let Err(err) = err {
-                println!(
+                log!(
                     "==> Failed set memory addr: 0x{addr:x}=0x{value:x} err:{err:?} ({})",
                     unicorn::error_text(err)
                 );
             } else {
-                println!("==> set memory addr: 0x{addr:x}=0x{value:x}");
+                log!("==> set memory addr: 0x{addr:x}=0x{value:x}");
             }
         } else {
             let addr = to_u32(&command);
             let value = unicorn::mem_read_u32(uc, addr as u64);
             if let Err(err) = value {
-                println!(
+                log!(
                     "==> Failed read memory addr: 0x{addr:x} err:{err:?} ({})",
                     unicorn::error_text(err)
                 );
@@ -177,7 +177,7 @@ fn execute_command(uc: *mut c_void, command: &str, pc: u32, size: u32) -> bool {
                 unsafe {
                     compat::dumpMemStr(&mut value as *mut u32 as *mut c_void, 4);
                 }
-                println!();
+                echo!();
             }
         }
     } else if let Some((reg_name, value)) = command.split_once('=') {
@@ -186,15 +186,15 @@ fn execute_command(uc: *mut c_void, command: &str, pc: u32, size: u32) -> bool {
         if let Some(reg) = reg {
             let err = unicorn::reg_write(uc, reg, value);
             if let Err(err) = err {
-                println!(
+                log!(
                     "==> Failed register assign {reg_name}=0x{value:x} err:{err:?} ({})",
                     unicorn::error_text(err)
                 );
             } else {
-                println!("==> register assign {reg_name}=0x{value:x}");
+                log!("==> register assign {reg_name}=0x{value:x}");
             }
         } else {
-            println!("==> register '{reg_name}' invalid");
+            log!("==> register '{reg_name}' invalid");
         }
     } else {
         print_help();

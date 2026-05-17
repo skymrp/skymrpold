@@ -321,4 +321,9 @@ You can also set SKYMRP_MYTHROAD_DIR to point skymrp at another mythroad directo
         let content = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/skymrp_options.txt"));
         create_file(&user_options, content);
     }
+
+    let options_help = base_path.join("OPTIONS_HELP.txt");
+    if !options_help.is_file() {
+        create_file(&options_help, crate::options::OPTIONS_HELP);
+    }
 }

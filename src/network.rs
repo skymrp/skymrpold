@@ -110,7 +110,7 @@ fn sockaddr_from_host_order(ip: c_int, port: c_ushort) -> libc::sockaddr_in {
 fn connect_sync_fd(fd: RawFd, ip: c_int, port: c_ushort) -> c_int {
     let addr = sockaddr_from_host_order(ip, port);
     let printable = Ipv4Addr::from(ip as u32);
-    println!("my_connect('{printable}', {port})");
+    log!("my_connect('{printable}', {port})");
 
     let ret = unsafe {
         libc::connect(
@@ -120,10 +120,10 @@ fn connect_sync_fd(fd: RawFd, ip: c_int, port: c_ushort) -> c_int {
         )
     };
     if ret == 0 {
-        println!("my_connect(0x{:X}) suc", ip);
+        log!("my_connect(0x{:X}) suc", ip);
         MR_SUCCESS
     } else {
-        println!(
+        log!(
             "my_connect(0x{:X}) fail: {}",
             ip,
             io::Error::last_os_error()
@@ -160,7 +160,7 @@ fn resolve_host_ipv4(name: &str) -> c_int {
     let addrs = match (name, 0).to_socket_addrs() {
         Ok(addrs) => addrs,
         Err(err) => {
-            println!("getaddrinfo failed for '{name}': {err}");
+            log!("getaddrinfo failed for '{name}': {err}");
             return MR_FAILED;
         }
     };
@@ -168,7 +168,7 @@ fn resolve_host_ipv4(name: &str) -> c_int {
     for addr in addrs {
         if let std::net::SocketAddr::V4(addr) = addr {
             let ip = u32::from_be_bytes(addr.ip().octets()) as c_int;
-            println!("--- IPv4 address: {}", addr.ip());
+            log!("--- IPv4 address: {}", addr.ip());
             return ip;
         }
     }
@@ -285,7 +285,7 @@ pub extern "C" fn my_connect(s: c_int, ip: c_int, port: c_ushort, type_: c_int) 
         return MR_SUCCESS;
     }
 
-    println!(
+    log!(
         "my_connect() type: {}",
         if type_ == MR_SOCKET_NONBLOCK {
             "async"
@@ -303,7 +303,7 @@ pub extern "C" fn my_connect(s: c_int, ip: c_int, port: c_ushort, type_: c_int) 
         {
             Ok(thread) => thread,
             Err(err) => {
-                eprintln!("my_connect async spawn failed: {err}");
+                log!("my_connect async spawn failed: {err}");
                 entry_guard.state = MR_FAILED;
                 entry_guard.real_state = MR_FAILED;
                 return MR_FAILED;
@@ -329,7 +329,7 @@ pub extern "C" fn my_getSocketState(s: c_int) -> c_int {
         return MR_FAILED;
     };
     let state = entry.lock().unwrap().state;
-    println!("my_getSocketState({s}): {state}");
+    log!("my_getSocketState({s}): {state}");
     state
 }
 
@@ -348,7 +348,7 @@ pub extern "C" fn my_socket(type_: c_int, protocol: c_int) -> c_int {
 
     let fd = unsafe { libc::socket(libc::AF_INET, socket_type, protocol) };
     if fd < 0 {
-        println!("my_socket() fail: {}", io::Error::last_os_error());
+        log!("my_socket() fail: {}", io::Error::last_os_error());
         return MR_FAILED;
     }
 
@@ -405,7 +405,7 @@ pub fn init_network_cstr(
     user_data: *mut c_void,
 ) -> c_int {
     let mode = cstr_ref_to_string(mode);
-    println!("my_initNetwork(0x{:p}, '{mode}')", cb);
+    log!("my_initNetwork(0x{:p}, '{mode}')", cb);
     network().lock().unwrap().is_cmwap = mode.to_ascii_lowercase().starts_with("cmwap");
 
     if cb.is_null() {
@@ -416,7 +416,7 @@ pub fn init_network_cstr(
     if thread::Builder::new()
         .name("skymrp-network-init".to_owned())
         .spawn(move || {
-            println!("my_initNetworkAsync(): {MR_SUCCESS}");
+            log!("my_initNetworkAsync(): {MR_SUCCESS}");
             invoke_network_callback(callback, MR_SUCCESS);
         })
         .is_err()
@@ -434,7 +434,7 @@ pub fn get_host_by_name_cstr(
     user_data: *mut c_void,
 ) -> c_int {
     let name = cstr_ref_to_string(name);
-    println!("my_getHostByName('{name}', 0x{:p})", cb);
+    log!("my_getHostByName('{name}', 0x{:p})", cb);
 
     if cb.is_null() {
         return resolve_host_ipv4(&name);
@@ -445,7 +445,7 @@ pub fn get_host_by_name_cstr(
         .name("skymrp-network-dns".to_owned())
         .spawn(move || {
             let result = resolve_host_ipv4(&name);
-            println!("my_getHostByNameAsync(): 0x{result:X}");
+            log!("my_getHostByNameAsync(): 0x{result:X}");
             invoke_network_callback(callback, result);
         })
         .is_err()
@@ -462,7 +462,7 @@ pub fn send_to(s: c_int, buf: &[u8], ip: c_int, port: c_ushort) -> c_int {
     };
     let fd = entry.lock().unwrap().fd;
     let addr = sockaddr_from_host_order(ip, port);
-    println!(
+    log!(
         "my_sendto(len:{}, '{}:{port}')",
         buf.len(),
         Ipv4Addr::from(ip as u32)
@@ -568,7 +568,7 @@ pub fn recv_from(s: c_int, buf: &mut [u8], ip: &mut c_int, port: &mut c_ushort) 
             }
             *port = u16::from_be(from.sin_port);
             *ip = u32::from_be(from.sin_addr.s_addr) as c_int;
-            println!(
+            log!(
                 "my_recvfrom(len:{}, '{}:{}')",
                 buf.len(),
                 Ipv4Addr::from(*ip as u32),

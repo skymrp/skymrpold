@@ -1,0 +1,8 @@
+.vscode/settings.json
+*.o
+*.a
+*.log
+mytest/
+vmrp
+lua-5.0.2/
+*.elf

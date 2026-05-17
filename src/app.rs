@@ -95,7 +95,7 @@ pub extern "C" fn play_sound(
     loop_: c_int,
 ) -> c_int {
     if data.is_null() && data_len != 0 {
-        eprintln!("mr_playSound failed: null data pointer with length {data_len}");
+        log!("mr_playSound failed: null data pointer with length {data_len}");
         return -1;
     }
 
@@ -133,7 +133,7 @@ pub extern "C" fn editCreate(
 pub fn edit_create_cstr(_title: &CStr, _text: &CStr, _type_: c_int, max_size: c_int) -> c_int {
     *EDIT_MODE.lock().unwrap() = true;
     *EDIT_MAX_SIZE.lock().unwrap() = max_size;
-    println!("编辑内容已复制到剪贴板，按ctrl+v输入内容，按ctrl+z取消");
+    log!("编辑内容已复制到剪贴板，按ctrl+v输入内容，按ctrl+z取消");
     1234
 }
 
@@ -243,7 +243,7 @@ fn show_missing_system_files_message(
 }
 
 pub fn run() -> Result<(), String> {
-    println!("Starting runtime from Rust...");
+    log!("Starting runtime from Rust...");
 
     let sdl_context = sdl2::init()?;
     let mythroad_dir = paths::ensure_mythroad_dir()?;
@@ -257,7 +257,7 @@ pub fn run() -> Result<(), String> {
     }
 
     let ret = start_runtime();
-    println!("start_runtime returned {}", ret);
+    log!("start_runtime returned {}", ret);
 
     let video_subsystem = sdl_context.video()?;
 
@@ -291,7 +291,7 @@ pub fn run() -> Result<(), String> {
                         || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD) =>
                     {
                         event(MR_DIALOG_EVENT, 1, 0);
-                        println!("取消输入");
+                        log!("取消输入");
                     }
                     Event::KeyDown {
                         keycode: Some(Keycode::V),
@@ -306,7 +306,7 @@ pub fn run() -> Result<(), String> {
                         event(MR_DIALOG_EVENT, 0, 0);
                     }
                     Event::MouseButtonDown { .. } => {
-                        println!("ctrl+v输入内容，ctrl+z取消输入");
+                        log!("ctrl+v输入内容，ctrl+z取消输入");
                     }
                     Event::Quit { .. } => break 'running,
                     _ => {}

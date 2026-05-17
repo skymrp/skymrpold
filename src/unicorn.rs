@@ -126,16 +126,11 @@ pub fn emu_start(
     with_handle_mut(handle, |uc| uc.emu_start(begin, until, timeout, count))
 }
 
-pub fn add_code_hook<F>(
-    handle: *mut c_void,
-    begin: u64,
-    end: u64,
-    callback: F,
-) -> Result<UcHookId, uc_error>
+pub fn add_intr_hook<F>(handle: *mut c_void, callback: F) -> Result<UcHookId, uc_error>
 where
-    F: for<'a, 'b> FnMut(&'a mut Unicorn<'b, ()>, u64, u32) + 'static,
+    F: for<'a, 'b> FnMut(&'a mut Unicorn<'b, ()>, u32) + 'static,
 {
-    with_handle_mut(handle, |uc| uc.add_code_hook(begin, end, callback))
+    with_handle_mut(handle, |uc| uc.add_intr_hook(callback))
 }
 
 pub fn add_mem_invalid_hook<F>(handle: *mut c_void, callback: F) -> Result<UcHookId, uc_error>

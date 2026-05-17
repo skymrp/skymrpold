@@ -148,7 +148,7 @@ fn guest_host_ptr(addr: u32, count: u32) -> *mut c_void {
 
 #[no_mangle]
 pub extern "C" fn initMemoryManager(base_address: u32, len: u32) {
-    println!("initMemoryManager: baseAddress:0x{base_address:X} len: 0x{len:X}");
+    log!("initMemoryManager: baseAddress:0x{base_address:X} len: 0x{len:X}");
     unsafe {
         Origin_LG_mem_base = runtime::guest_host_ptr_mut(base_address, 1) as *mut c_char;
         Origin_LG_mem_len = len;
@@ -179,12 +179,12 @@ pub extern "C" fn printMemoryInfo() {
         let mem_end = LG_mem_end;
         let origin_base = Origin_LG_mem_base;
         let origin_len = Origin_LG_mem_len;
-        println!(
+        log!(
             ".......total:{}, min:{}, free:{}, top:{}",
             mem_len, mem_min, mem_left, mem_top
         );
-        println!(".......base:{:p}, end:{:p}", mem_base, mem_end);
-        println!(".......obase:{:p}, olen:{}", origin_base, origin_len);
+        log!(".......base:{:p}, end:{:p}", mem_base, mem_end);
+        log!(".......obase:{:p}, olen:{}", origin_base, origin_len);
     }
 }
 
@@ -192,15 +192,15 @@ pub extern "C" fn printMemoryInfo() {
 pub extern "C" fn my_malloc(mut len: u32) -> *mut c_void {
     len = real_lg_mem_size(len);
     if len == 0 {
-        println!("my_malloc invalid memory request");
+        log!("my_malloc invalid memory request");
         return ptr::null_mut();
     }
     if unsafe { len >= LG_mem_left } {
-        println!("my_malloc no memory");
+        log!("my_malloc no memory");
         return ptr::null_mut();
     }
     let Some(addr) = alloc_guest(len) else {
-        println!("my_malloc no memory");
+        log!("my_malloc no memory");
         return ptr::null_mut();
     };
     guest_host_ptr(addr, len)
@@ -424,8 +424,8 @@ fn read_reg(uc: *mut c_void, reg: RegisterARM) -> u32 {
 #[no_mangle]
 pub extern "C" fn dumpREG(uc: *mut c_void) {
     let cpsr = read_reg(uc, RegisterARM::CPSR);
-    println!("==========================REG=================================");
-    println!(
+    log!("==========================REG=================================");
+    log!(
         " R0=0x{:08X}\tR1=0x{:08X}\t R2=0x{:08X}\t R3=0x{:08X}\tN:{}",
         read_reg(uc, RegisterARM::R0),
         read_reg(uc, RegisterARM::R1),
@@ -433,7 +433,7 @@ pub extern "C" fn dumpREG(uc: *mut c_void) {
         read_reg(uc, RegisterARM::R3),
         (cpsr & (1 << 31)) >> 31
     );
-    println!(
+    log!(
         " R4=0x{:08X}\tR5=0x{:08X}\t R6=0x{:08X}\t R7=0x{:08X}\tZ:{}",
         read_reg(uc, RegisterARM::R4),
         read_reg(uc, RegisterARM::R5),
@@ -441,7 +441,7 @@ pub extern "C" fn dumpREG(uc: *mut c_void) {
         read_reg(uc, RegisterARM::R7),
         (cpsr & (1 << 30)) >> 30
     );
-    println!(
+    log!(
         " R8=0x{:08X}\tR9=0x{:08X}\tR10=0x{:08X}\tR11=0x{:08X}\tC:{}",
         read_reg(uc, RegisterARM::R8),
         read_reg(uc, RegisterARM::R9),
@@ -449,7 +449,7 @@ pub extern "C" fn dumpREG(uc: *mut c_void) {
         read_reg(uc, RegisterARM::R11),
         (cpsr & (1 << 29)) >> 29
     );
-    println!(
+    log!(
         "R12=0x{:08X}\tSP=0x{:08X}\t LR=0x{:08X}\t PC=0x{:08X}\tV:{}",
         read_reg(uc, RegisterARM::R12),
         read_reg(uc, RegisterARM::SP),
@@ -457,7 +457,7 @@ pub extern "C" fn dumpREG(uc: *mut c_void) {
         read_reg(uc, RegisterARM::PC),
         (cpsr & (1 << 28)) >> 28
     );
-    println!("==============================================================");
+    log!("==============================================================");
 }
 
 #[no_mangle]

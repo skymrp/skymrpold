@@ -155,7 +155,7 @@ pub unsafe extern "C" fn init_runtime() -> *mut c_void {
     let mut engine = match unicorn::new_arm() {
         Ok(engine) => engine,
         Err(err) => {
-            println!(
+            log!(
                 "Failed on uc_open() with error returned: {err:?} ({})",
                 unicorn::error_text(err)
             );
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn init_runtime() -> *mut c_void {
     let map_result = (|| {
         MRP_MEM = libc::malloc(TOTAL_MEMORY as usize) as *mut u8;
         if MRP_MEM.is_null() {
-            println!("Failed malloc mrp memory");
+            log!("Failed malloc mrp memory");
             return Err(());
         }
 
@@ -179,11 +179,11 @@ pub unsafe extern "C" fn init_runtime() -> *mut c_void {
                 MRP_MEM as *mut c_void,
             )
             .map_err(|err| {
-                println!("Failed mem map: {err:?} ({})", unicorn::error_text(err));
+                log!("Failed mem map: {err:?} ({})", unicorn::error_text(err));
             })?;
 
         rebuild_guest_mem().map_err(|_| {
-            println!("Failed init guest memory map");
+            log!("Failed init guest memory map");
         })?;
 
         compat::initMemoryManager(MEMORY_MANAGER_ADDRESS, MEMORY_MANAGER_SIZE);
@@ -199,36 +199,36 @@ pub unsafe extern "C" fn init_runtime() -> *mut c_void {
 
     let init_result = (|| {
         if bridge::bridge_init(uc) != MR_SUCCESS {
-            println!("Failed bridge_init()");
+            log!("Failed bridge_init()");
             return Err(());
         }
 
         LOW_MEM = libc::malloc(CODE_ADDRESS as usize) as *mut u8;
         if LOW_MEM.is_null() {
-            println!("Failed malloc low memory");
+            log!("Failed malloc low memory");
             return Err(());
         }
         ptr::write_bytes(LOW_MEM, 0, CODE_ADDRESS as usize);
         unicorn::mem_map_ptr(uc, 0, CODE_ADDRESS as u64, LOW_MEM as *mut c_void).map_err(
             |err| {
-                println!("Failed low mem map: {err:?} ({})", unicorn::error_text(err));
+                log!("Failed low mem map: {err:?} ({})", unicorn::error_text(err));
             },
         )?;
 
         rebuild_guest_mem().map_err(|_| {
-            println!("Failed update guest memory map");
+            log!("Failed update guest memory map");
         })?;
 
         unicorn::add_mem_invalid_hook(uc, |uc, type_, address, size, value| {
             let type_name = unicorn::mem_type_name(type_);
-            println!(
+            log!(
                 ">>> Tracing mem_invalid mem_type:{type_name} at 0x{address:X}, size:0x{size:X}, value:0x{value:X}"
             );
             compat::dumpREG(uc.get_handle().cast::<c_void>());
             false
         })
         .map_err(|err| {
-            println!(
+            log!(
                 "Failed hook mem invalid: {err:?} ({})",
                 unicorn::error_text(err)
             );
@@ -236,7 +236,7 @@ pub unsafe extern "C" fn init_runtime() -> *mut c_void {
 
         let sp = STACK_ADDRESS + STACK_SIZE;
         unicorn::reg_write(uc, RegisterARM::SP, sp).map_err(|err| {
-            println!("Failed set stack: {err:?} ({})", unicorn::error_text(err));
+            log!("Failed set stack: {err:?} ({})", unicorn::error_text(err));
         })?;
 
         Ok(())
@@ -280,14 +280,14 @@ pub unsafe extern "C" fn loadCode() -> c_int {
             let cwd = std::env::current_dir()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|err| format!("<failed to read cwd: {err}>"));
-            println!("loadCode failed to read cfunction.ext from cwd {cwd}: {err}");
+            log!("loadCode failed to read cfunction.ext from cwd {cwd}: {err}");
             return MR_FAILED;
         }
     };
 
     let err = unicorn::mem_write(UC, CODE_ADDRESS as u64, &data);
     if let Err(err) = err {
-        println!(
+        log!(
             "uc_mem_write code failed: {err:?} ({})",
             unicorn::error_text(err)
         );
@@ -301,19 +301,19 @@ pub extern "C" fn start_runtime() -> c_int {
     unsafe {
         UC = init_runtime();
         if UC.is_null() {
-            println!("init_runtime() fail.");
+            log!("init_runtime() fail.");
             return MR_FAILED;
         }
 
         if loadCode() == MR_FAILED {
-            println!("loadCode fail.");
+            log!("loadCode fail.");
             return MR_FAILED;
         }
 
         bridge::bridge_ext_init(UC);
 
         if bridge::bridge_dsm_init(UC) == MR_SUCCESS {
-            println!("bridge_dsm_init success");
+            log!("bridge_dsm_init success");
             compat::dumpREG(UC);
 
             let filename = b"dsm_gm.mrp\0";
@@ -324,7 +324,7 @@ pub extern "C" fn start_runtime() -> c_int {
                 ext_name.as_ptr() as *mut c_char,
                 ptr::null_mut(),
             );
-            println!("bridge_dsm_mr_start_dsm('dsm_gm.mrp','start.mr',NULL): 0x{ret:X}");
+            log!("bridge_dsm_mr_start_dsm('dsm_gm.mrp','start.mr',NULL): 0x{ret:X}");
         }
 
         MR_SUCCESS

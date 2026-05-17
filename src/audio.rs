@@ -176,7 +176,7 @@ impl RustAudioBackend {
             .play()
             .map_err(|err| AudioError::PlayStream(err.to_string()))?;
 
-        println!(
+        log!(
             "Audio initialized: {:?}, {} Hz, SoundFont {}",
             supported.sample_format(),
             sample_rate,
@@ -559,7 +559,7 @@ mod sonivox {
                 .play()
                 .map_err(|err| AudioError::PlayStream(err.to_string()))?;
 
-            println!(
+            log!(
                 "Audio initialized: {:?}, {} Hz, Sonivox embedded wavetable",
                 supported.sample_format(),
                 sample_rate
@@ -609,7 +609,9 @@ mod sonivox {
         sample_format: SampleFormat,
         state: Arc<Mutex<SonivoxPlaybackState>>,
     ) -> Result<Stream, AudioError> {
-        let err_fn = |err| eprintln!("audio stream error: {err}");
+        let err_fn = |err| {
+            log!("audio stream error: {err}");
+        };
         let channels = config.channels as usize;
         match sample_format {
             SampleFormat::F32 => device
@@ -721,7 +723,9 @@ fn build_stream(
     sample_format: SampleFormat,
     state: Arc<Mutex<PlaybackState>>,
 ) -> Result<Stream, AudioError> {
-    let err_fn = |err| eprintln!("audio stream error: {err}");
+    let err_fn = |err| {
+        log!("audio stream error: {err}");
+    };
     let channels = config.channels as usize;
     match sample_format {
         SampleFormat::F32 => device
@@ -842,7 +846,9 @@ impl AudioBackend {
         if preferred == "rustysynth" {
             match RustAudioBackend::new() {
                 Ok(backend) => return Ok(Self::SoundFont(backend)),
-                Err(err) => eprintln!("SoundFont backend unavailable, falling back: {err}"),
+                Err(err) => {
+                    log!("SoundFont backend unavailable, falling back: {err}");
+                }
             }
         }
 
@@ -851,7 +857,9 @@ impl AudioBackend {
             match sonivox::SonivoxAudioBackend::new() {
                 Ok(backend) => return Ok(Self::Sonivox(backend)),
                 Err(err) if preferred == "sonivox" => return Err(err),
-                Err(err) => eprintln!("Sonivox backend unavailable, falling back: {err}"),
+                Err(err) => {
+                    log!("Sonivox backend unavailable, falling back: {err}");
+                }
             }
         }
 
@@ -916,7 +924,7 @@ pub fn play_sound_from_guest(ty: i32, data: &[u8], looped: bool) -> i32 {
     match result {
         Ok(()) => MR_SUCCESS,
         Err(err) => {
-            eprintln!("mr_playSound failed: {err}");
+            log!("mr_playSound failed: {err}");
             MR_FAILED
         }
     }
@@ -935,7 +943,7 @@ pub fn stop_sound_from_guest(ty: i32) -> i32 {
     match result {
         Ok(()) => MR_SUCCESS,
         Err(err) => {
-            eprintln!("mr_stopSound failed: {err}");
+            log!("mr_stopSound failed: {err}");
             MR_FAILED
         }
     }
