@@ -1,0 +1,3 @@
+[submodule "vendor/sonivox"]
+	path = vendor/sonivox
+	url = https://github.com/skymrp/sonivox.git
