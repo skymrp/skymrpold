@@ -176,14 +176,12 @@ fn resolve_host_ipv4(name: &str) -> c_int {
 }
 
 fn invoke_network_callback(callback: NetworkCallback, result: c_int) {
-    unsafe {
-        bridge::bridge_dsm_network_cb(
-            callback.uc as *mut c_void,
-            callback.addr,
-            result,
-            callback.user_data,
-        );
-    }
+    bridge::bridge_dsm_network_cb(
+        callback.uc as *mut c_void,
+        callback.addr,
+        result,
+        callback.user_data,
+    );
 }
 
 fn callback_from_parts(
@@ -273,8 +271,7 @@ fn parse_host_port(line: &str) -> Option<(String, c_ushort)> {
     Some((host, port))
 }
 
-#[no_mangle]
-pub extern "C" fn my_connect(s: c_int, ip: c_int, port: c_ushort, type_: c_int) -> c_int {
+pub fn connect(s: c_int, ip: c_int, port: c_ushort, type_: c_int) -> c_int {
     let Some(entry) = socket_entry(s) else {
         return MR_FAILED;
     };
@@ -323,8 +320,7 @@ pub extern "C" fn my_connect(s: c_int, ip: c_int, port: c_ushort, type_: c_int) 
     }
 }
 
-#[no_mangle]
-pub extern "C" fn my_getSocketState(s: c_int) -> c_int {
+pub fn socket_state(s: c_int) -> c_int {
     let Some(entry) = socket_entry(s) else {
         return MR_FAILED;
     };
@@ -333,8 +329,7 @@ pub extern "C" fn my_getSocketState(s: c_int) -> c_int {
     state
 }
 
-#[no_mangle]
-pub extern "C" fn my_socket(type_: c_int, protocol: c_int) -> c_int {
+pub fn socket(type_: c_int, protocol: c_int) -> c_int {
     let socket_type = if type_ == MR_SOCK_STREAM {
         libc::SOCK_STREAM
     } else {
@@ -369,8 +364,7 @@ pub extern "C" fn my_socket(type_: c_int, protocol: c_int) -> c_int {
     handle
 }
 
-#[no_mangle]
-pub extern "C" fn my_closeSocket(s: c_int) -> c_int {
+pub fn close_socket(s: c_int) -> c_int {
     let entry = network().lock().unwrap().sockets.remove(&s);
     match entry {
         Some(entry) => close_entry(entry),
@@ -378,8 +372,7 @@ pub extern "C" fn my_closeSocket(s: c_int) -> c_int {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn my_closeNetwork() -> c_int {
+pub fn close_network() -> c_int {
     let entries = {
         let mut state = network().lock().unwrap();
         state
@@ -517,7 +510,7 @@ pub fn send(s: c_int, buf: &[u8]) -> c_int {
         if ip == MR_FAILED {
             return MR_FAILED;
         }
-        if my_connect(s, ip, port, MR_SOCKET_NONBLOCK) == MR_FAILED {
+        if connect(s, ip, port, MR_SOCKET_NONBLOCK) == MR_FAILED {
             return MR_FAILED;
         }
         return 0;

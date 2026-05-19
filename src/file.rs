@@ -221,6 +221,15 @@ pub fn readdir_name(fd: i32) -> Option<Vec<u8>> {
     Some(entry.file_name().as_encoded_bytes().to_vec())
 }
 
+pub fn closedir(fd: i32) -> i32 {
+    let mut map = DIR_MAP.lock().unwrap();
+    if map.remove(&(fd as u32)).is_some() {
+        MR_SUCCESS
+    } else {
+        MR_FAILED
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn my_open(filename: *const c_char, mode: u32) -> i32 {
     if filename.is_null() {
@@ -334,12 +343,7 @@ pub extern "C" fn my_readdir(fd: i32) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn my_closedir(fd: i32) -> i32 {
-    let mut map = DIR_MAP.lock().unwrap();
-    if map.remove(&(fd as u32)).is_some() {
-        MR_SUCCESS
-    } else {
-        MR_FAILED
-    }
+    closedir(fd)
 }
 
 pub fn write_file_cstr(filename: &CStr, mut data: &[u8]) {

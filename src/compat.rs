@@ -127,7 +127,7 @@ fn alloc_guest(len: u32) -> Option<u32> {
     unsafe {
         LG_mem_left = LG_mem_left.saturating_sub(len);
         LG_mem_min = LG_mem_min.min(LG_mem_left);
-        LG_mem_top = LG_mem_top.max(addr.saturating_sub(runtime::toMrpMemAddr(LG_mem_base.cast())));
+        LG_mem_top = LG_mem_top.max(addr.saturating_sub(runtime::to_mrp_mem_addr(LG_mem_base.cast())));
     }
     Some(addr)
 }
@@ -146,9 +146,8 @@ fn guest_host_ptr(addr: u32, count: u32) -> *mut c_void {
     runtime::guest_host_ptr_mut(addr, count)
 }
 
-#[no_mangle]
-pub extern "C" fn initMemoryManager(base_address: u32, len: u32) {
-    log!("initMemoryManager: baseAddress:0x{base_address:X} len: 0x{len:X}");
+pub fn init_memory_manager(base_address: u32, len: u32) {
+    log!("init_memory_manager: baseAddress:0x{base_address:X} len: 0x{len:X}");
     unsafe {
         Origin_LG_mem_base = runtime::guest_host_ptr_mut(base_address, 1) as *mut c_char;
         Origin_LG_mem_len = len;
@@ -163,7 +162,7 @@ pub extern "C" fn initMemoryManager(base_address: u32, len: u32) {
         FREE_LIST.with(|free_list| {
             free_list
                 .borrow_mut()
-                .init(runtime::toMrpMemAddr(LG_mem_base.cast()), LG_mem_len);
+                .init(runtime::to_mrp_mem_addr(LG_mem_base.cast()), LG_mem_len);
         });
     }
 }
@@ -211,7 +210,7 @@ pub extern "C" fn my_free(p: *mut c_void, _len: u32) {
     if p.is_null() {
         return;
     }
-    let addr = runtime::toMrpMemAddr(p);
+    let addr = runtime::to_mrp_mem_addr(p);
     free_guest(addr);
 }
 
@@ -224,7 +223,7 @@ pub extern "C" fn my_realloc(p: *mut c_void, oldlen: u32, len: u32) -> *mut c_vo
         my_free(p, oldlen);
         return ptr::null_mut();
     }
-    let old_addr = runtime::toMrpMemAddr(p);
+    let old_addr = runtime::to_mrp_mem_addr(p);
     let new_len = real_lg_mem_size(len);
     let Some((new_addr, old_len)) =
         FREE_LIST.with(|free_list| free_list.borrow_mut().realloc(old_addr, new_len))
@@ -295,7 +294,7 @@ pub fn free_ext(p: *mut c_void) {
     if p.is_null() {
         return;
     }
-    let payload = runtime::toMrpMemAddr(p);
+    let payload = runtime::to_mrp_mem_addr(p);
     free_ext_guest(MutVoidPtr::from_bits(payload));
 }
 
@@ -318,7 +317,7 @@ pub fn realloc_ext(p: *mut c_void, new_len: u32) -> *mut c_void {
     let ptr = if p.is_null() {
         MutVoidPtr::null()
     } else {
-        MutVoidPtr::from_bits(runtime::toMrpMemAddr(p))
+        MutVoidPtr::from_bits(runtime::to_mrp_mem_addr(p))
     };
     let new_ptr = realloc_ext_guest(ptr, new_len);
     if new_ptr.is_null() {
@@ -384,8 +383,7 @@ pub extern "C" fn printScreen(filename: *mut c_char, buf: *mut u16) {
     file::my_close(fd);
 }
 
-#[no_mangle]
-pub extern "C" fn memTypeStr(type_: c_int) -> *mut c_char {
+pub fn mem_type_str(type_: c_int) -> *mut c_char {
     let s: &[u8] = match type_ {
         UC_MEM_READ => b"UC_MEM_READ\0",
         UC_MEM_WRITE => b"UC_MEM_WRITE\0",
@@ -402,8 +400,7 @@ pub extern "C" fn memTypeStr(type_: c_int) -> *mut c_char {
     s.as_ptr() as *mut c_char
 }
 
-#[no_mangle]
-pub extern "C" fn cpsrToStr(v: u32, out: *mut c_char) {
+pub fn cpsr_to_str(v: u32, out: *mut c_char) {
     if out.is_null() {
         return;
     }
@@ -421,8 +418,7 @@ fn read_reg(uc: *mut c_void, reg: RegisterARM) -> u32 {
     unicorn::reg_read(uc, reg).unwrap_or(0)
 }
 
-#[no_mangle]
-pub extern "C" fn dumpREG(uc: *mut c_void) {
+pub fn dump_reg(uc: *mut c_void) {
     let cpsr = read_reg(uc, RegisterARM::CPSR);
     log!("==========================REG=================================");
     log!(
@@ -552,12 +548,11 @@ pub extern "C" fn copyWstrToMrp(str_: *mut c_char) -> u32 {
             return 0;
         }
         ptr::copy_nonoverlapping(str_ as *const u8, p as *mut u8, len);
-        runtime::toMrpMemAddr(p)
+        runtime::to_mrp_mem_addr(p)
     }
 }
 
-#[no_mangle]
-pub extern "C" fn copyStrToMrp(str_: *mut c_char) -> u32 {
+pub fn copy_str_to_mrp(str_: *mut c_char) -> u32 {
     unsafe {
         if str_.is_null() {
             return 0;
@@ -568,12 +563,11 @@ pub extern "C" fn copyStrToMrp(str_: *mut c_char) -> u32 {
             return 0;
         }
         ptr::copy_nonoverlapping(str_ as *const u8, p as *mut u8, len);
-        runtime::toMrpMemAddr(p)
+        runtime::to_mrp_mem_addr(p)
     }
 }
 
-#[no_mangle]
-pub extern "C" fn get_uptime_ms() -> i64 {
+pub fn get_uptime_ms() -> i64 {
     static START: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
     START
         .get_or_init(SystemTime::now)

@@ -73,15 +73,13 @@ pub fn draw_bitmap(bmp: &[u16], x: c_int, y: c_int, w: c_int, h: c_int) {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn timerStart(t: u16) -> c_int {
+pub fn timer_start(t: u16) -> c_int {
     let mut timer_target = TIMER_TARGET.lock().unwrap();
     *timer_target = Some(std::time::Instant::now() + std::time::Duration::from_millis(t as u64));
     0
 }
 
-#[no_mangle]
-pub extern "C" fn timerStop() -> c_int {
+pub fn timer_stop() -> c_int {
     let mut timer_target = TIMER_TARGET.lock().unwrap();
     *timer_target = None;
     0
@@ -107,8 +105,7 @@ pub fn play_sound_bytes(type_: c_int, data: &[u8], loop_: bool) -> c_int {
     audio::play_sound_from_guest(type_, data, loop_)
 }
 
-#[no_mangle]
-pub extern "C" fn stop_sound(type_: c_int) -> c_int {
+pub fn stop_sound(type_: c_int) -> c_int {
     audio::stop_sound_from_guest(type_)
 }
 

@@ -72,7 +72,7 @@ fn dump_file(command: &str) {
     let addr = to_u32(addr);
     let len = to_u32(len);
     unsafe {
-        file::writeFile(filename.as_ptr(), runtime::getMrpMemPtr(addr), len);
+        file::writeFile(filename.as_ptr(), runtime::get_mrp_mem_ptr(addr), len);
     }
 }
 
@@ -98,7 +98,7 @@ fn print_prompt(uc: *mut c_void, address: u64, size: u32) {
     let cpsr = read_reg(uc, RegisterARM::CPSR);
     let mut cpsr_str = [0 as c_char; 5];
     unsafe {
-        compat::cpsrToStr(cpsr, cpsr_str.as_mut_ptr());
+        compat::cpsr_to_str(cpsr, cpsr_str.as_mut_ptr());
     }
     let cpsr_str = unsafe { CStr::from_ptr(cpsr_str.as_ptr()) }.to_string_lossy();
     let mode = if cpsr & (1 << 5) != 0 { "THUMB" } else { "ARM" };
@@ -128,7 +128,7 @@ fn execute_command(uc: *mut c_void, command: &str, pc: u32, size: u32) -> bool {
 
     if command == "reg" {
         unsafe {
-            compat::dumpREG(uc);
+            compat::dump_reg(uc);
         }
     } else if command.starts_with("run") {
         RUN.store(true, Ordering::Relaxed);
