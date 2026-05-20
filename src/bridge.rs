@@ -1,13 +1,13 @@
 use crate::abi::{self, AbiReg, GuestArg, GuestRet, RegisterContext, StackMemoryContext};
 use crate::mem::{ConstPtr, GuestUSize, MutPtr, Ptr, SafeWrite};
 use crate::runtime;
+use crate::syscall;
 use crate::unicorn;
 use crate::{app, compat, file, network};
 use libc::{c_char, c_int, c_ushort, c_void};
-use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use unicorn_engine::RegisterARM;
 
 const MR_SUCCESS: c_int = 0;
@@ -26,7 +26,6 @@ const FLAG_USE_UTF8_EDIT: u32 = 1 << 1;
 
 const READDIR_SHARED_MEM_SIZE: usize = 128;
 const DSM_REQUIRE_FUNCS_SIZE: u32 = 0xd0;
-const BRIDGE_SVC_BASE: u32 = 0x100;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BridgeMapType {
@@ -69,8 +68,6 @@ struct Start {
     entry: u32,
 }
 
-static HOOKS: OnceLock<Mutex<HashMap<u32, BridgeEntry>>> = OnceLock::new();
-static SVC_HOOKS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
 static BRIDGE_LOCK: Mutex<()> = Mutex::new(());
 
 static mut MR_TABLE: *mut c_void = ptr::null_mut();
@@ -111,14 +108,6 @@ macro_rules! entry {
             handler: $handler,
         }
     };
-}
-
-fn hooks() -> &'static Mutex<HashMap<u32, BridgeEntry>> {
-    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn svc_hooks() -> &'static Mutex<HashSet<usize>> {
-    SVC_HOOKS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 struct BridgeContext {
@@ -268,126 +257,14 @@ fn run_code(ctx: &mut BridgeContext, mut start_addr: u32, stop_addr: u32, is_thu
     }
 }
 
-fn encode_a32_svc(imm: u32) -> u32 {
-    assert!(imm & 0xff00_0000 == 0);
-    0xef00_0000 | imm
-}
-
-fn encode_a32_bx_lr() -> u32 {
-    0xe12f_ff1e
-}
-
-fn decode_svc(uc: *mut c_void) -> Option<u32> {
-    let cpsr = match unicorn::reg_read(uc, RegisterARM::CPSR) {
-        Ok(cpsr) => cpsr,
-        Err(err) => {
-            log!(
-                "[SVC] failed to read CPSR: {err:?} ({})",
-                unicorn::error_text(err)
-            );
-            return None;
-        }
-    };
-    let pc = match unicorn::reg_read(uc, RegisterARM::PC) {
-        Ok(pc) => pc,
-        Err(err) => {
-            log!(
-                "[SVC] failed to read PC: {err:?} ({})",
-                unicorn::error_text(err)
-            );
-            return None;
-        }
-    };
-    let is_thumb = (cpsr & 0x20) != 0;
-    log!("[SVC] decode start pc=0x{pc:08X} cpsr=0x{cpsr:08X} thumb={is_thumb}");
-    if is_thumb {
-        let Some(addr) = pc.checked_sub(2) else {
-            log!("[SVC] thumb PC underflow while decoding pc=0x{pc:08X}");
-            return None;
-        };
-        let mut bytes = [0u8; 2];
-        if let Err(err) = unicorn::mem_read(uc, addr as u64, &mut bytes) {
-            log!(
-                "[SVC] failed to read thumb instruction at 0x{addr:08X}: {err:?} ({})",
-                unicorn::error_text(err)
-            );
-            return None;
-        }
-        let instruction = u16::from_le_bytes(bytes);
-        if instruction & 0xff00 == 0xdf00 {
-            let svc = (instruction & 0x00ff) as u32;
-            log!("[SVC] decoded thumb instruction=0x{instruction:04X} addr=0x{addr:08X} svc=#{svc}");
-            Some(svc)
-        } else {
-            log!("[SVC] non-SVC thumb instruction=0x{instruction:04X} addr=0x{addr:08X}");
-            None
-        }
-    } else {
-        let Some(addr) = pc.checked_sub(4) else {
-            log!("[SVC] arm PC underflow while decoding pc=0x{pc:08X}");
-            return None;
-        };
-        let instruction = match unicorn::mem_read_u32(uc, addr as u64) {
-            Ok(instruction) => instruction,
-            Err(err) => {
-                log!(
-                    "[SVC] failed to read arm instruction at 0x{addr:08X}: {err:?} ({})",
-                    unicorn::error_text(err)
-                );
-                return None;
-            }
-        };
-        if instruction & 0xff00_0000 == 0xef00_0000 {
-            let svc = instruction & 0x00ff_ffff;
-            log!("[SVC] decoded arm instruction=0x{instruction:08X} addr=0x{addr:08X} svc=#{svc}");
-            Some(svc)
-        } else {
-            log!("[SVC] non-SVC arm instruction=0x{instruction:08X} addr=0x{addr:08X}");
-            None
-        }
-    }
-}
-
-fn write_svc_stub(uc: *mut c_void, addr: u32, svc: u32) {
-    unicorn::mem_write_u32(uc, addr as u64, encode_a32_svc(svc)).unwrap();
-    unicorn::mem_write_u32(uc, (addr + 4) as u64, encode_a32_bx_lr()).unwrap();
-}
-
-fn handle_bridge_svc(uc: *mut c_void, svc: u32) {
-    let pc = unicorn::reg_read(uc, RegisterARM::PC).unwrap_or(0);
-    let lr = unicorn::reg_read(uc, RegisterARM::LR).unwrap_or(0);
-    let sp = unicorn::reg_read(uc, RegisterARM::SP).unwrap_or(0);
-    let r0 = unicorn::reg_read(uc, RegisterARM::R0).unwrap_or(0);
-    let r1 = unicorn::reg_read(uc, RegisterARM::R1).unwrap_or(0);
-    let r2 = unicorn::reg_read(uc, RegisterARM::R2).unwrap_or(0);
-    let r3 = unicorn::reg_read(uc, RegisterARM::R3).unwrap_or(0);
-    log!(
-        "[SVC] dispatch svc=#{svc} pc=0x{pc:08X} lr=0x{lr:08X} sp=0x{sp:08X} args=[0x{r0:08X}, 0x{r1:08X}, 0x{r2:08X}, 0x{r3:08X}]"
-    );
-
-    let entry = {
-        let map = hooks().lock().unwrap();
-        map.get(&svc).copied()
-    };
-
-    let Some(entry) = entry else {
-        log!("!!! unknown bridge SVC #{svc} !!!");
-        return;
-    };
-    if entry.type_ != BridgeMapType::Func {
-        log!("!!! unregister function for SVC #{svc} !!!");
-        return;
-    }
-
+fn dispatch_bridge_svc(uc: *mut c_void, svc: u32, entry: usize) {
+    let entry = unsafe { *(entry as *const BridgeEntry) };
     let Some(handler) = entry.handler else {
         log!("!!! {}() Not yet implemented function !!!", entry.name);
         std::process::exit(1);
     };
 
-    log!(
-        "[SVC] -> {} pos=0x{:X} type=func",
-        entry.name, entry.pos
-    );
+    log!("[SVC] -> {} pos=0x{:X} type=func", entry.name, entry.pos);
     let mut ctx = BridgeContext::new(uc);
     handler(&entry, &mut ctx);
     let ret = ctx.arg::<u32>(0);
@@ -399,33 +276,6 @@ fn handle_bridge_svc(uc: *mut c_void, svc: u32) {
     );
 }
 
-fn hook_svc(uc: *mut c_void) {
-    let Some(svc) = decode_svc(uc) else {
-        log!("!!! failed to decode SVC !!!");
-        return;
-    };
-    handle_bridge_svc(uc, svc);
-}
-
-fn ensure_svc_hook(uc: *mut c_void) {
-    let handle = uc as usize;
-    {
-        let hooks = svc_hooks().lock().unwrap();
-        if hooks.contains(&handle) {
-            return;
-        }
-    }
-
-    if let Err(err) = unicorn::add_intr_hook(uc, |engine, _intno| {
-        hook_svc(engine.get_handle().cast::<c_void>());
-    }) {
-        log!("add SVC hook err {err:?} ({})", unicorn::error_text(err));
-        std::process::exit(1);
-    }
-
-    svc_hooks().lock().unwrap().insert(handle);
-}
-
 fn hooks_init(uc: *mut c_void, map: &'static [BridgeEntry], table_size: u32) -> *mut c_void {
     let func_count = map
         .iter()
@@ -435,7 +285,6 @@ fn hooks_init(uc: *mut c_void, map: &'static [BridgeEntry], table_size: u32) -> 
     let start_address = runtime::to_mrp_mem_addr(ptr);
     let mut stub_address = start_address + table_size;
 
-    let mut hooks = hooks().lock().unwrap();
     for obj in map {
         let addr = start_address + obj.pos;
         match obj.type_ {
@@ -448,14 +297,15 @@ fn hooks_init(uc: *mut c_void, map: &'static [BridgeEntry], table_size: u32) -> 
                 if let Some(init) = obj.init {
                     init(obj, uc, addr);
                 }
-                let svc = BRIDGE_SVC_BASE + hooks.len() as u32;
-                write_svc_stub(uc, stub_address, svc);
+                let svc = syscall::link_host_function(
+                    uc,
+                    stub_address,
+                    obj.name,
+                    dispatch_bridge_svc,
+                    obj as *const BridgeEntry as usize,
+                );
                 unicorn::mem_write_u32(uc, addr as u64, stub_address).ok();
-                if hooks.insert(svc, *obj).is_some() {
-                    log!("hook insert failed SVC #{svc} exists.");
-                    compat::free_ext(ptr);
-                    std::process::exit(1);
-                }
+                log!("[SVC] linked {} pos=0x{:X} svc=#{svc}", obj.name, obj.pos);
                 stub_address += 8;
             }
         }
@@ -1106,7 +956,7 @@ static DSM_REQUIRE_FUNCS_MAP: &[BridgeEntry] = &[
 ];
 
 pub fn bridge_init(uc: *mut c_void) -> c_int {
-    ensure_svc_hook(uc);
+    syscall::ensure_unicorn_svc_hook(uc);
 
     let len = 4 * MR_TABLE_FUNC_MAP.len() as u32;
     unsafe {
@@ -1174,12 +1024,7 @@ fn bridge_mr_event(uc: *mut c_void, code: c_int, param0: c_int, param1: c_int) -
     )
 }
 
-pub fn bridge_dsm_network_cb(
-    uc: *mut c_void,
-    addr: u32,
-    p0: c_int,
-    p1: u32,
-) -> c_int {
+pub fn bridge_dsm_network_cb(uc: *mut c_void, addr: u32, p0: c_int, p1: u32) -> c_int {
     let _guard = BRIDGE_LOCK.lock().unwrap();
     let mut ctx = BridgeContext::new(uc);
     let r9 = ctx.read_reg(AbiReg::R9);
