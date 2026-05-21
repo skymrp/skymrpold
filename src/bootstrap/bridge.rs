@@ -1,7 +1,7 @@
 use crate::abi::{self, AbiReg, GuestArg, GuestRet, RegisterContext, StackMemoryContext};
-use crate::mem::{ConstPtr, GuestUSize, MutPtr, Ptr, SafeWrite};
 use crate::bootstrap;
-use crate::syscall::{self, Syscall};
+use crate::mem::{ConstPtr, GuestUSize, MutPtr, Ptr, SafeWrite};
+use crate::syscall::Syscall;
 use crate::unicorn;
 use crate::{compat, file, network, window};
 use libc::{c_char, c_int, c_ushort, c_void};
@@ -33,7 +33,7 @@ enum BridgeMapType {
     Func,
 }
 
-type BridgeHandler = fn(&BridgeEntry, &mut BridgeContext);
+type BridgeHandler = &'static dyn BridgeCallFromGuest;
 type BridgeInit = fn(&BridgeEntry, *mut c_void, u32);
 
 #[derive(Clone, Copy)]
@@ -80,6 +80,40 @@ static mut MR_EXT_HELPER_ADDR: u32 = 0;
 static mut READDIR_SHARED_MEM: u32 = 0;
 static mut UPTIME_MS: u64 = 0;
 
+trait BridgeCallFromGuest: Sync {
+    fn call_from_guest(&self, entry: &BridgeEntry, ctx: &mut BridgeContext);
+}
+
+impl BridgeCallFromGuest for fn(&BridgeEntry, &mut BridgeContext) {
+    fn call_from_guest(&self, entry: &BridgeEntry, ctx: &mut BridgeContext) {
+        self(entry, ctx);
+    }
+}
+
+macro_rules! impl_bridge_call_from_guest {
+    ( $($p:tt => $P:ident),* ) => {
+        impl<R, $($P),*> BridgeCallFromGuest for fn(&mut BridgeContext, $($P),*) -> R
+        where
+            R: GuestRet,
+            $($P: GuestArg,)*
+        {
+            #[allow(unused_variables, unused_mut, clippy::unused_unit)]
+            fn call_from_guest(&self, _entry: &BridgeEntry, ctx: &mut BridgeContext) {
+                let args: ($($P,)*) = ($(ctx.arg::<$P>($p),)*);
+                let ret = self(ctx, $(args.$p),*);
+                ctx.ret(ret);
+            }
+        }
+    };
+}
+
+impl_bridge_call_from_guest!();
+impl_bridge_call_from_guest!(0 => P0);
+impl_bridge_call_from_guest!(0 => P0, 1 => P1);
+impl_bridge_call_from_guest!(0 => P0, 1 => P1, 2 => P2);
+impl_bridge_call_from_guest!(0 => P0, 1 => P1, 2 => P2, 3 => P3);
+impl_bridge_call_from_guest!(0 => P0, 1 => P1, 2 => P2, 3 => P3, 4 => P4);
+
 macro_rules! entry {
     ($pos:expr, data, $name:expr) => {
         BridgeEntry {
@@ -90,22 +124,58 @@ macro_rules! entry {
             handler: None,
         }
     };
-    ($pos:expr, func, $name:expr, $handler:expr) => {
+    ($pos:expr, func, $name:expr, None) => {
         BridgeEntry {
             pos: $pos,
             type_: BridgeMapType::Func,
             name: $name,
             init: None,
-            handler: $handler,
+            handler: None,
         }
     };
-    ($pos:expr, func, $name:expr, $init:expr, $handler:expr) => {
+    ($pos:expr, func, $name:expr, Some($handler:path)) => {
+        BridgeEntry {
+            pos: $pos,
+            type_: BridgeMapType::Func,
+            name: $name,
+            init: None,
+            handler: Some(&($handler as fn(&BridgeEntry, &mut BridgeContext)) as BridgeHandler),
+        }
+    };
+    ($pos:expr, func, $name:expr, typed $handler:path as $ty:ty) => {
+        BridgeEntry {
+            pos: $pos,
+            type_: BridgeMapType::Func,
+            name: $name,
+            init: None,
+            handler: Some(&($handler as $ty) as BridgeHandler),
+        }
+    };
+    ($pos:expr, func, $name:expr, $init:expr, typed $handler:path as $ty:ty) => {
         BridgeEntry {
             pos: $pos,
             type_: BridgeMapType::Func,
             name: $name,
             init: $init,
-            handler: $handler,
+            handler: Some(&($handler as $ty) as BridgeHandler),
+        }
+    };
+    ($pos:expr, func, $name:expr, $init:expr, None) => {
+        BridgeEntry {
+            pos: $pos,
+            type_: BridgeMapType::Func,
+            name: $name,
+            init: $init,
+            handler: None,
+        }
+    };
+    ($pos:expr, func, $name:expr, $init:expr, Some($handler:path)) => {
+        BridgeEntry {
+            pos: $pos,
+            type_: BridgeMapType::Func,
+            name: $name,
+            init: $init,
+            handler: Some(&($handler as fn(&BridgeEntry, &mut BridgeContext)) as BridgeHandler),
         }
     };
 }
@@ -266,7 +336,7 @@ fn dispatch_bridge_svc(uc: *mut c_void, svc: u32, entry: usize) {
 
     log!("[SVC] -> {} pos=0x{:X} type=func", entry.name, entry.pos);
     let mut ctx = BridgeContext::new(uc);
-    handler(&entry, &mut ctx);
+    handler.call_from_guest(&entry, &mut ctx);
     let ret = ctx.arg::<u32>(0);
     let pc = ctx.read_reg(AbiReg::PC);
     let lr = ctx.read_reg(AbiReg::LR);
@@ -318,9 +388,7 @@ fn hooks_init(
     ptr
 }
 
-fn br_mr_c_function_new(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let p_f = ctx.arg::<u32>(0);
-    let p_len = ctx.arg::<u32>(1);
+fn br_mr_c_function_new(ctx: &mut BridgeContext, p_f: u32, p_len: u32) -> u32 {
     log!("ext call _mr_c_function_new(0x{p_f:X}[{p_f}], 0x{p_len:X}[{p_len}])");
     compat::dump_reg(ctx.uc());
 
@@ -333,41 +401,37 @@ fn br_mr_c_function_new(_o: &BridgeEntry, ctx: &mut BridgeContext) {
 
     let v = bootstrap::to_mrp_mem_addr(mr_c_function_p as *mut c_void);
     ctx.mem_write_u32(CODE_ADDRESS + 4, v);
-    ctx.ret(MR_SUCCESS as u32);
+    MR_SUCCESS as u32
 }
 
-fn br_mr_malloc(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let len = ctx.arg::<u32>(0);
-    ctx.ret(compat::malloc_ext_guest(len));
+fn br_mr_malloc(_ctx: &mut BridgeContext, len: u32) -> MutPtr<c_void> {
+    compat::malloc_ext_guest(len)
 }
 
-fn br_mr_free(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let p = ctx.guest_arg::<c_void, true>(0);
+fn br_mr_free(_ctx: &mut BridgeContext, p: MutPtr<c_void>) {
     compat::free_ext_guest(p);
 }
 
-fn br_memcpy(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let dst = ctx.guest_arg::<c_void, true>(0);
-    let src = ctx.guest_arg::<c_void, false>(1);
-    let n = ctx.arg::<u32>(2);
+fn br_memcpy(
+    ctx: &mut BridgeContext,
+    dst: MutPtr<c_void>,
+    src: ConstPtr<c_void>,
+    n: u32,
+) -> MutPtr<c_void> {
     ctx.memmove(dst, src, n);
-    ctx.ret(dst.to_bits());
+    dst
 }
 
-fn br_memset(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let dst = ctx.guest_arg::<u8, true>(0);
-    let value = ctx.arg::<u32>(1);
-    let n = ctx.arg::<u32>(2);
+fn br_memset(ctx: &mut BridgeContext, dst: MutPtr<u8>, value: u32, n: u32) -> MutPtr<u8> {
     ctx.with_bytes_mut(dst, n, |bytes| bytes.fill(value as u8));
-    ctx.ret(dst.to_bits());
+    dst
 }
 
-fn br_mr_draw_bitmap(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let bmp = ctx.guest_arg::<u16, false>(0);
-    let x = ctx.arg::<u32>(1) as c_int;
-    let y = ctx.arg::<u32>(2) as c_int;
-    let w = ctx.arg::<u32>(3) as c_int;
-    let h = ctx.arg::<u32>(4) as c_int;
+fn br_mr_draw_bitmap(ctx: &mut BridgeContext, bmp: ConstPtr<u16>, x: u32, y: u32, w: u32, h: u32) {
+    let x = x as c_int;
+    let y = y as c_int;
+    let w = w as c_int;
+    let h = h as c_int;
     let pixel_count = (w as u32).saturating_mul(h as u32);
     ctx.with_bytes(bmp.cast::<u8>(), pixel_count.saturating_mul(2), |bytes| {
         let pixels = bytes
@@ -378,70 +442,44 @@ fn br_mr_draw_bitmap(_o: &BridgeEntry, ctx: &mut BridgeContext) {
     });
 }
 
-fn br_mr_open(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let filename = ctx.guest_arg::<u8, false>(0);
-    let mode = ctx.arg::<u32>(1);
-    let ret = ctx.with_cstr(filename, |filename| file::open_cstr(filename, mode));
-    ctx.ret(ret as u32);
+fn br_mr_open(ctx: &mut BridgeContext, filename: ConstPtr<u8>, mode: u32) -> u32 {
+    ctx.with_cstr(filename, |filename| file::open_cstr(filename, mode)) as u32
 }
 
-fn br_mr_close(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let f = ctx.arg::<u32>(0) as c_int;
-    ctx.ret(file::close(f) as u32);
+fn br_mr_close(_ctx: &mut BridgeContext, f: u32) -> u32 {
+    file::close(f as c_int) as u32
 }
 
-fn br_mr_write(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let f = ctx.arg::<u32>(0) as c_int;
-    let p = ctx.guest_arg::<u8, false>(1);
-    let l = ctx.arg::<u32>(2);
-    let ret = ctx.with_bytes(p, l, |bytes| file::write_from(f, bytes));
-    ctx.ret(ret as u32);
+fn br_mr_write(ctx: &mut BridgeContext, f: u32, p: ConstPtr<u8>, l: u32) -> u32 {
+    ctx.with_bytes(p, l, |bytes| file::write_from(f as c_int, bytes)) as u32
 }
 
-fn br_mr_read(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let f = ctx.arg::<u32>(0) as c_int;
-    let p = ctx.guest_arg::<u8, true>(1);
-    let l = ctx.arg::<u32>(2);
-    let ret = ctx.with_bytes_mut(p, l, |bytes| file::read_into(f, bytes));
-    ctx.ret(ret as u32);
+fn br_mr_read(ctx: &mut BridgeContext, f: u32, p: MutPtr<u8>, l: u32) -> u32 {
+    ctx.with_bytes_mut(p, l, |bytes| file::read_into(f as c_int, bytes)) as u32
 }
 
-fn br_mr_seek(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let f = ctx.arg::<u32>(0) as c_int;
-    let pos = ctx.arg::<u32>(1) as c_int;
-    let method = ctx.arg::<u32>(2) as c_int;
-    ctx.ret(file::seek(f, pos, method) as u32);
+fn br_mr_seek(_ctx: &mut BridgeContext, f: u32, pos: u32, method: u32) -> u32 {
+    file::seek(f as c_int, pos as c_int, method as c_int) as u32
 }
 
-fn br_mr_get_len(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let filename = ctx.guest_arg::<u8, false>(0);
-    let ret = ctx.with_cstr(filename, file::get_len_cstr);
-    ctx.ret(ret as u32);
+fn br_mr_get_len(ctx: &mut BridgeContext, filename: ConstPtr<u8>) -> u32 {
+    ctx.with_cstr(filename, file::get_len_cstr) as u32
 }
 
-fn br_mr_remove(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let filename = ctx.guest_arg::<u8, false>(0);
-    let ret = ctx.with_cstr(filename, file::remove_cstr);
-    ctx.ret(ret as u32);
+fn br_mr_remove(ctx: &mut BridgeContext, filename: ConstPtr<u8>) -> u32 {
+    ctx.with_cstr(filename, file::remove_cstr) as u32
 }
 
-fn br_mr_rename(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let oldname = ctx.guest_arg::<u8, false>(0);
-    let newname = ctx.guest_arg::<u8, false>(1);
-    let ret = ctx.with_two_cstr(oldname, newname, file::rename_cstr);
-    ctx.ret(ret as u32);
+fn br_mr_rename(ctx: &mut BridgeContext, oldname: ConstPtr<u8>, newname: ConstPtr<u8>) -> u32 {
+    ctx.with_two_cstr(oldname, newname, file::rename_cstr) as u32
 }
 
-fn br_mr_mkdir(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let name = ctx.guest_arg::<u8, false>(0);
-    let ret = ctx.with_cstr(name, file::mkdir_cstr);
-    ctx.ret(ret as u32);
+fn br_mr_mkdir(ctx: &mut BridgeContext, name: ConstPtr<u8>) -> u32 {
+    ctx.with_cstr(name, file::mkdir_cstr) as u32
 }
 
-fn br_mr_rmdir(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let name = ctx.guest_arg::<u8, false>(0);
-    let ret = ctx.with_cstr(name, file::rmdir_cstr);
-    ctx.ret(ret as u32);
+fn br_mr_rmdir(ctx: &mut BridgeContext, name: ConstPtr<u8>) -> u32 {
+    ctx.with_cstr(name, file::rmdir_cstr) as u32
 }
 
 fn br_get_uptime_ms_init(_o: &BridgeEntry, uc: *mut c_void, addr: u32) {
@@ -451,85 +489,74 @@ fn br_get_uptime_ms_init(_o: &BridgeEntry, uc: *mut c_void, addr: u32) {
     unicorn::mem_write_u32(uc, addr as u64, addr).ok();
 }
 
-fn br_get_uptime_ms(_o: &BridgeEntry, ctx: &mut BridgeContext) {
+fn br_get_uptime_ms(_ctx: &mut BridgeContext) -> u32 {
     let uptime_ms = unsafe { UPTIME_MS };
-    let ret = (compat::get_uptime_ms() as u64).wrapping_sub(uptime_ms) as u32;
-    ctx.ret(ret);
+    (compat::get_uptime_ms() as u64).wrapping_sub(uptime_ms) as u32
 }
 
-fn br_log(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let msg = ctx.guest_arg::<u8, false>(0);
+fn br_log(ctx: &mut BridgeContext, msg: ConstPtr<u8>) {
     if !msg.is_null() {
         let text = ctx.with_cstr(msg, |msg| msg.to_string_lossy().into_owned());
         log!("{text}");
     }
 }
 
-fn br_mem_get(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let mem_base = ctx.arg::<u32>(0);
-    let mem_len = ctx.arg::<u32>(1);
+fn br_mem_get(ctx: &mut BridgeContext, mem_base: MutPtr<u32>, mem_len: MutPtr<u32>) -> u32 {
     let len = 1024 * 1024 * 4u32;
-    let buffer = compat::malloc_ext_guest(len).to_bits();
+    let buffer = compat::malloc_ext_guest(len);
     log!(
-        "br_mem_get base=0x{buffer:X} len={len}({} kb) =================",
+        "br_mem_get base=0x{:X} len={len}({} kb) =================",
+        buffer.to_bits(),
         len / 1024
     );
-    ctx.mem_write_u32(mem_base, buffer);
-    ctx.mem_write_u32(mem_len, len);
-    ctx.ret(MR_SUCCESS as u32);
+    ctx.write_guest(mem_base, buffer.to_bits());
+    ctx.write_guest(mem_len, len);
+    MR_SUCCESS as u32
 }
 
-fn br_mem_free(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let mem = ctx.guest_arg::<c_void, true>(0);
+fn br_mem_free(_ctx: &mut BridgeContext, mem: MutPtr<c_void>) -> u32 {
     compat::free_ext_guest(mem);
-    ctx.ret(MR_SUCCESS as u32);
+    MR_SUCCESS as u32
 }
 
-fn br_timer_stop(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    ctx.ret(window::timer_stop() as u32);
+fn br_timer_stop(_ctx: &mut BridgeContext) -> u32 {
+    window::timer_stop() as u32
 }
 
-fn br_timer_start(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let t = ctx.arg::<u32>(0);
-    ctx.ret(window::timer_start(t as c_ushort) as u32);
+fn br_timer_start(_ctx: &mut BridgeContext, t: u32) -> u32 {
+    window::timer_start(t as c_ushort) as u32
 }
 
-fn br_test(_o: &BridgeEntry, _ctx: &mut BridgeContext) {}
+fn br_test(_ctx: &mut BridgeContext) {}
 
-fn br_exit(_o: &BridgeEntry, _ctx: &mut BridgeContext) {
+fn br_exit(_ctx: &mut BridgeContext) {
     log!("mythroad exit.\n");
     std::process::exit(0);
 }
 
-fn br_srand(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let seed = ctx.arg::<u32>(0);
+fn br_srand(_ctx: &mut BridgeContext, seed: u32) {
     unsafe {
         libc::srand(seed);
     }
 }
 
-fn br_rand(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    ctx.ret(unsafe { libc::rand() } as u32);
+fn br_rand(_ctx: &mut BridgeContext) -> u32 {
+    (unsafe { libc::rand() }) as u32
 }
 
-fn br_sleep(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let ms = ctx.arg::<u32>(0);
+fn br_sleep(_ctx: &mut BridgeContext, ms: u32) -> u32 {
     unsafe {
         libc::usleep(ms.saturating_mul(1000));
     }
-    ctx.ret(MR_SUCCESS as u32);
+    MR_SUCCESS as u32
 }
 
-fn br_info(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let filename = ctx.guest_arg::<u8, false>(0);
-    let ret = ctx.with_cstr(filename, file::info_cstr);
-    ctx.ret(ret as u32);
+fn br_info(ctx: &mut BridgeContext, filename: ConstPtr<u8>) -> u32 {
+    ctx.with_cstr(filename, file::info_cstr) as u32
 }
 
-fn br_opendir(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let name = ctx.guest_arg::<u8, false>(0);
-    let ret = ctx.with_cstr(name, file::opendir_cstr);
-    ctx.ret(ret as u32);
+fn br_opendir(ctx: &mut BridgeContext, name: ConstPtr<u8>) -> u32 {
+    ctx.with_cstr(name, file::opendir_cstr) as u32
 }
 
 fn br_readdir_init(_o: &BridgeEntry, uc: *mut c_void, addr: u32) {
@@ -547,16 +574,13 @@ fn br_readdir_init(_o: &BridgeEntry, uc: *mut c_void, addr: u32) {
     unicorn::mem_write_u32(uc, addr as u64, addr).ok();
 }
 
-fn br_readdir(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let f = ctx.arg::<u32>(0) as c_int;
-    let Some(name) = file::readdir_name(f) else {
-        ctx.ret(0);
-        return;
+fn br_readdir(_ctx: &mut BridgeContext, f: u32) -> u32 {
+    let Some(name) = file::readdir_name(f as c_int) else {
+        return 0;
     };
     let shared_mem = unsafe { READDIR_SHARED_MEM };
     if shared_mem == 0 {
-        ctx.ret(0);
-        return;
+        return 0;
     }
     let len = name.len().min(READDIR_SHARED_MEM_SIZE - 1);
     bootstrap::with_guest_mem_mut(|mem| {
@@ -567,19 +591,16 @@ fn br_readdir(_o: &BridgeEntry, ctx: &mut BridgeContext) {
         bytes.fill(0);
         bytes[..len].copy_from_slice(&name[..len]);
     });
-    ctx.ret(shared_mem);
+    shared_mem
 }
 
-fn br_closedir(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let f = ctx.arg::<u32>(0) as c_int;
-    ctx.ret(file::closedir(f) as u32);
+fn br_closedir(_ctx: &mut BridgeContext, f: u32) -> u32 {
+    file::closedir(f as c_int) as u32
 }
 
-fn br_get_datetime(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let datetime = ctx.guest_arg::<c_void, true>(0);
+fn br_get_datetime(ctx: &mut BridgeContext, datetime: MutPtr<c_void>) -> u32 {
     let Some(now) = compat::current_datetime() else {
-        ctx.ret(MR_FAILED as u32);
-        return;
+        return MR_FAILED as u32;
     };
     let base = datetime.to_bits();
     ctx.write_guest(MutPtr::<u16>::from_bits(base), now.year);
@@ -588,163 +609,148 @@ fn br_get_datetime(_o: &BridgeEntry, ctx: &mut BridgeContext) {
     ctx.write_guest(MutPtr::<u8>::from_bits(base + 4), now.hour);
     ctx.write_guest(MutPtr::<u8>::from_bits(base + 5), now.minute);
     ctx.write_guest(MutPtr::<u8>::from_bits(base + 6), now.second);
-    ctx.ret(MR_SUCCESS as u32);
+    MR_SUCCESS as u32
 }
 
-fn br_mr_init_network(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let cb = ctx.arg::<u32>(0);
-    let mode = ctx.guest_arg::<u8, false>(1);
-    let user_data = ctx.arg::<u32>(2);
-    let ret = ctx.with_cstr(mode, |mode| {
+fn br_mr_init_network(ctx: &mut BridgeContext, cb: u32, mode: ConstPtr<u8>, user_data: u32) -> u32 {
+    ctx.with_cstr(mode, |mode| {
         network::init_network_cstr(
             ctx.uc(),
             cb as usize as *mut c_void,
             mode,
             user_data as usize as *mut c_void,
         )
-    });
-    ctx.ret(ret as u32);
+    }) as u32
 }
 
-fn br_mr_socket(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let type_ = ctx.arg::<u32>(0) as c_int;
-    let protocol = ctx.arg::<u32>(1) as c_int;
-    ctx.ret(network::socket(type_, protocol) as u32);
+fn br_mr_socket(_ctx: &mut BridgeContext, type_: u32, protocol: u32) -> u32 {
+    network::socket(type_ as c_int, protocol as c_int) as u32
 }
 
-fn br_mr_connect(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let s = ctx.arg::<u32>(0) as c_int;
-    let ip = ctx.arg::<u32>(1) as c_int;
-    let port = ctx.arg::<u32>(2) as c_ushort;
-    let type_ = ctx.arg::<u32>(3) as c_int;
-    ctx.ret(network::connect(s, ip, port, type_) as u32);
+fn br_mr_connect(_ctx: &mut BridgeContext, s: u32, ip: u32, port: u32, type_: u32) -> u32 {
+    network::connect(s as c_int, ip as c_int, port as c_ushort, type_ as c_int) as u32
 }
 
-fn br_mr_close_socket(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let s = ctx.arg::<u32>(0) as c_int;
-    ctx.ret(network::close_socket(s) as u32);
+fn br_mr_close_socket(_ctx: &mut BridgeContext, s: u32) -> u32 {
+    network::close_socket(s as c_int) as u32
 }
 
-fn br_mr_close_network(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    ctx.ret(network::close_network() as u32);
+fn br_mr_close_network(_ctx: &mut BridgeContext) -> u32 {
+    network::close_network() as u32
 }
 
-fn br_mr_get_host_by_name(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let name = ctx.guest_arg::<u8, false>(0);
-    let cb = ctx.arg::<u32>(1);
-    let user_data = ctx.arg::<u32>(2);
-    let ret = ctx.with_cstr(name, |name| {
+fn br_mr_get_host_by_name(
+    ctx: &mut BridgeContext,
+    name: ConstPtr<u8>,
+    cb: u32,
+    user_data: u32,
+) -> u32 {
+    ctx.with_cstr(name, |name| {
         network::get_host_by_name_cstr(
             ctx.uc(),
             name,
             cb as usize as *mut c_void,
             user_data as usize as *mut c_void,
         )
-    });
-    ctx.ret(ret as u32);
+    }) as u32
 }
 
-fn br_mr_sendto(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let s = ctx.arg::<u32>(0) as c_int;
-    let buf = ctx.guest_arg::<u8, false>(1);
-    let len = ctx.arg::<u32>(2) as c_int;
-    let ip = ctx.arg::<u32>(3) as c_int;
-    let port = ctx.arg::<u32>(4) as c_ushort;
-    let ret = ctx.with_bytes(buf, len as u32, |buf| network::send_to(s, buf, ip, port));
-    ctx.ret(ret as u32);
+fn br_mr_sendto(
+    ctx: &mut BridgeContext,
+    s: u32,
+    buf: ConstPtr<u8>,
+    len: u32,
+    ip: u32,
+    port: u32,
+) -> u32 {
+    ctx.with_bytes(buf, len, |buf| {
+        network::send_to(s as c_int, buf, ip as c_int, port as c_ushort)
+    }) as u32
 }
 
-fn br_mr_send(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let s = ctx.arg::<u32>(0) as c_int;
-    let buf = ctx.guest_arg::<u8, false>(1);
-    let len = ctx.arg::<u32>(2) as c_int;
-    let ret = ctx.with_bytes(buf, len as u32, |buf| network::send(s, buf));
-    ctx.ret(ret as u32);
+fn br_mr_send(ctx: &mut BridgeContext, s: u32, buf: ConstPtr<u8>, len: u32) -> u32 {
+    ctx.with_bytes(buf, len, |buf| network::send(s as c_int, buf)) as u32
 }
 
-fn br_mr_recvfrom(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let s = ctx.arg::<u32>(0) as c_int;
-    let buf = ctx.guest_arg::<u8, true>(1);
-    let len = ctx.arg::<u32>(2) as c_int;
-    let ip = ctx.guest_arg::<c_int, true>(3);
-    let port = ctx.guest_arg::<c_ushort, true>(4);
+fn br_mr_recvfrom(
+    ctx: &mut BridgeContext,
+    s: u32,
+    buf: MutPtr<u8>,
+    len: u32,
+    ip: MutPtr<c_int>,
+    port: MutPtr<c_ushort>,
+) -> u32 {
     let mut ip_value = 0;
     let mut port_value = 0;
-    let ret = ctx.with_bytes_mut(buf, len as u32, |buf| {
-        network::recv_from(s, buf, &mut ip_value, &mut port_value)
+    let ret = ctx.with_bytes_mut(buf, len, |buf| {
+        network::recv_from(s as c_int, buf, &mut ip_value, &mut port_value)
     });
     ctx.write_guest(ip, ip_value);
     ctx.write_guest(port, port_value);
-    ctx.ret(ret as u32);
+    ret as u32
 }
 
-fn br_mr_recv(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let s = ctx.arg::<u32>(0) as c_int;
-    let buf = ctx.guest_arg::<u8, true>(1);
-    let len = ctx.arg::<u32>(2) as c_int;
-    let ret = ctx.with_bytes_mut(buf, len as u32, |buf| network::recv(s, buf));
-    ctx.ret(ret as u32);
+fn br_mr_recv(ctx: &mut BridgeContext, s: u32, buf: MutPtr<u8>, len: u32) -> u32 {
+    ctx.with_bytes_mut(buf, len, |buf| network::recv(s as c_int, buf)) as u32
 }
 
-fn br_mr_get_socket_state(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let s = ctx.arg::<u32>(0) as c_int;
-    ctx.ret(network::socket_state(s) as u32);
+fn br_mr_get_socket_state(_ctx: &mut BridgeContext, s: u32) -> u32 {
+    network::socket_state(s as c_int) as u32
 }
 
-fn br_mr_play_sound(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let type_ = ctx.arg::<u32>(0) as c_int;
-    let data = ctx.guest_arg::<u8, false>(1);
-    let data_len = ctx.arg::<u32>(2);
-    let loop_ = ctx.arg::<u32>(3) as c_int;
-    let ret = ctx.with_bytes(data, data_len, |data| {
-        window::play_sound_bytes(type_, data, loop_ != 0)
-    });
-    ctx.ret(ret as u32);
+fn br_mr_play_sound(
+    ctx: &mut BridgeContext,
+    type_: u32,
+    data: ConstPtr<u8>,
+    data_len: u32,
+    loop_: u32,
+) -> u32 {
+    ctx.with_bytes(data, data_len, |data| {
+        window::play_sound_bytes(type_ as c_int, data, loop_ != 0)
+    }) as u32
 }
 
-fn br_mr_stop_sound(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let type_ = ctx.arg::<u32>(0) as c_int;
-    ctx.ret(window::stop_sound(type_) as u32);
+fn br_mr_stop_sound(_ctx: &mut BridgeContext, type_: u32) -> u32 {
+    window::stop_sound(type_ as c_int) as u32
 }
 
-fn br_mr_start_shake(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    ctx.ret(MR_SUCCESS as u32);
+fn br_mr_start_shake(_ctx: &mut BridgeContext) -> u32 {
+    MR_SUCCESS as u32
 }
 
-fn br_mr_stop_shake(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    ctx.ret(MR_SUCCESS as u32);
+fn br_mr_stop_shake(_ctx: &mut BridgeContext) -> u32 {
+    MR_SUCCESS as u32
 }
 
-fn br_return_failed(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    ctx.ret(MR_FAILED as u32);
+fn br_return_failed(_ctx: &mut BridgeContext) -> u32 {
+    MR_FAILED as u32
 }
 
-fn br_mr_edit_create(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let title = ctx.guest_arg::<u8, false>(0);
-    let text = ctx.guest_arg::<u8, false>(1);
-    let type_ = ctx.arg::<u32>(2) as c_int;
-    let max_size = ctx.arg::<u32>(3) as c_int;
-    let ret = ctx.with_two_cstr(title, text, |title, text| {
-        window::edit_create_cstr(title, text, type_, max_size)
-    });
-    ctx.ret(ret as u32);
+fn br_mr_edit_create(
+    ctx: &mut BridgeContext,
+    title: ConstPtr<u8>,
+    text: ConstPtr<u8>,
+    type_: u32,
+    max_size: u32,
+) -> u32 {
+    ctx.with_two_cstr(title, text, |title, text| {
+        window::edit_create_cstr(title, text, type_ as c_int, max_size as c_int)
+    }) as u32
 }
 
-fn br_mr_edit_release(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let _edit = ctx.arg::<u32>(0) as c_int;
-    ctx.ret(window::edit_release() as u32);
+fn br_mr_edit_release(_ctx: &mut BridgeContext, _edit: u32) -> u32 {
+    window::edit_release() as u32
 }
 
-fn br_mr_edit_get_text(_o: &BridgeEntry, ctx: &mut BridgeContext) {
-    let _edit = ctx.arg::<u32>(0) as c_int;
-    ctx.ret(bootstrap::to_mrp_mem_addr(window::edit_get_text() as *mut c_void));
+fn br_mr_edit_get_text(_ctx: &mut BridgeContext, _edit: u32) -> u32 {
+    bootstrap::to_mrp_mem_addr(window::edit_get_text() as *mut c_void)
 }
 
 static MR_TABLE_FUNC_MAP: &[BridgeEntry] = &[
-    entry!(0x0, func, "mr_malloc", Some(br_mr_malloc)),
-    entry!(0x4, func, "mr_free", Some(br_mr_free)),
+    entry!(0x0, func, "mr_malloc", typed br_mr_malloc as fn(&mut BridgeContext, u32) -> MutPtr<c_void>),
+    entry!(0x4, func, "mr_free", typed br_mr_free as fn(&mut BridgeContext, MutPtr<c_void>)),
     entry!(0x8, func, "mr_realloc", None),
-    entry!(0xC, func, "memcpy", Some(br_memcpy)),
+    entry!(0xC, func, "memcpy", typed br_memcpy as fn(&mut BridgeContext, MutPtr<c_void>, ConstPtr<c_void>, u32) -> MutPtr<c_void>),
     entry!(0x10, func, "memmove", None),
     entry!(0x14, func, "strcpy", None),
     entry!(0x18, func, "strncpy", None),
@@ -755,7 +761,7 @@ static MR_TABLE_FUNC_MAP: &[BridgeEntry] = &[
     entry!(0x2C, func, "strncmp", None),
     entry!(0x30, func, "strcoll", None),
     entry!(0x34, func, "memchr", None),
-    entry!(0x38, func, "memset", Some(br_memset)),
+    entry!(0x38, func, "memset", typed br_memset as fn(&mut BridgeContext, MutPtr<u8>, u32, u32) -> MutPtr<u8>),
     entry!(0x3C, func, "strlen", None),
     entry!(0x40, func, "strstr", None),
     entry!(0x44, func, "sprintf", None),
@@ -766,7 +772,7 @@ static MR_TABLE_FUNC_MAP: &[BridgeEntry] = &[
     entry!(0x58, data, "reserve1"),
     entry!(0x5C, data, "_mr_c_internal_table"),
     entry!(0x60, data, "_mr_c_port_table"),
-    entry!(0x64, func, "_mr_c_function_new", Some(br_mr_c_function_new)),
+    entry!(0x64, func, "_mr_c_function_new", typed br_mr_c_function_new as fn(&mut BridgeContext, u32, u32) -> u32),
     entry!(0x68, func, "mr_printf", None),
     entry!(0x6C, func, "mr_mem_get", None),
     entry!(0x70, func, "mr_mem_free", None),
@@ -890,74 +896,74 @@ static MR_TABLE_FUNC_MAP: &[BridgeEntry] = &[
 ];
 
 static DSM_REQUIRE_FUNCS_MAP: &[BridgeEntry] = &[
-    entry!(0x0, func, "test", Some(br_test)),
-    entry!(0x4, func, "log", Some(br_log)),
-    entry!(0x8, func, "exit", Some(br_exit)),
-    entry!(0xC, func, "srand", Some(br_srand)),
-    entry!(0x10, func, "rand", Some(br_rand)),
-    entry!(0x14, func, "mem_get", Some(br_mem_get)),
-    entry!(0x18, func, "mem_free", Some(br_mem_free)),
-    entry!(0x1C, func, "timerStart", Some(br_timer_start)),
-    entry!(0x20, func, "timerStop", Some(br_timer_stop)),
+    entry!(0x0, func, "test", typed br_test as fn(&mut BridgeContext)),
+    entry!(0x4, func, "log", typed br_log as fn(&mut BridgeContext, ConstPtr<u8>)),
+    entry!(0x8, func, "exit", typed br_exit as fn(&mut BridgeContext)),
+    entry!(0xC, func, "srand", typed br_srand as fn(&mut BridgeContext, u32)),
+    entry!(0x10, func, "rand", typed br_rand as fn(&mut BridgeContext) -> u32),
+    entry!(0x14, func, "mem_get", typed br_mem_get as fn(&mut BridgeContext, MutPtr<u32>, MutPtr<u32>) -> u32),
+    entry!(0x18, func, "mem_free", typed br_mem_free as fn(&mut BridgeContext, MutPtr<c_void>) -> u32),
+    entry!(0x1C, func, "timerStart", typed br_timer_start as fn(&mut BridgeContext, u32) -> u32),
+    entry!(0x20, func, "timerStop", typed br_timer_stop as fn(&mut BridgeContext) -> u32),
     entry!(
         0x24,
         func,
         "get_uptime_ms",
         Some(br_get_uptime_ms_init),
-        Some(br_get_uptime_ms)
+        typed br_get_uptime_ms as fn(&mut BridgeContext) -> u32
     ),
-    entry!(0x28, func, "getDatetime", Some(br_get_datetime)),
-    entry!(0x2C, func, "sleep", Some(br_sleep)),
-    entry!(0x30, func, "open", Some(br_mr_open)),
-    entry!(0x34, func, "close", Some(br_mr_close)),
-    entry!(0x38, func, "read", Some(br_mr_read)),
-    entry!(0x3C, func, "write", Some(br_mr_write)),
-    entry!(0x40, func, "seek", Some(br_mr_seek)),
-    entry!(0x44, func, "info", Some(br_info)),
-    entry!(0x48, func, "remove", Some(br_mr_remove)),
-    entry!(0x4C, func, "rename", Some(br_mr_rename)),
-    entry!(0x50, func, "mkDir", Some(br_mr_mkdir)),
-    entry!(0x54, func, "rmDir", Some(br_mr_rmdir)),
-    entry!(0x58, func, "opendir", Some(br_opendir)),
+    entry!(0x28, func, "getDatetime", typed br_get_datetime as fn(&mut BridgeContext, MutPtr<c_void>) -> u32),
+    entry!(0x2C, func, "sleep", typed br_sleep as fn(&mut BridgeContext, u32) -> u32),
+    entry!(0x30, func, "open", typed br_mr_open as fn(&mut BridgeContext, ConstPtr<u8>, u32) -> u32),
+    entry!(0x34, func, "close", typed br_mr_close as fn(&mut BridgeContext, u32) -> u32),
+    entry!(0x38, func, "read", typed br_mr_read as fn(&mut BridgeContext, u32, MutPtr<u8>, u32) -> u32),
+    entry!(0x3C, func, "write", typed br_mr_write as fn(&mut BridgeContext, u32, ConstPtr<u8>, u32) -> u32),
+    entry!(0x40, func, "seek", typed br_mr_seek as fn(&mut BridgeContext, u32, u32, u32) -> u32),
+    entry!(0x44, func, "info", typed br_info as fn(&mut BridgeContext, ConstPtr<u8>) -> u32),
+    entry!(0x48, func, "remove", typed br_mr_remove as fn(&mut BridgeContext, ConstPtr<u8>) -> u32),
+    entry!(0x4C, func, "rename", typed br_mr_rename as fn(&mut BridgeContext, ConstPtr<u8>, ConstPtr<u8>) -> u32),
+    entry!(0x50, func, "mkDir", typed br_mr_mkdir as fn(&mut BridgeContext, ConstPtr<u8>) -> u32),
+    entry!(0x54, func, "rmDir", typed br_mr_rmdir as fn(&mut BridgeContext, ConstPtr<u8>) -> u32),
+    entry!(0x58, func, "opendir", typed br_opendir as fn(&mut BridgeContext, ConstPtr<u8>) -> u32),
     entry!(
         0x5C,
         func,
         "readdir",
         Some(br_readdir_init),
-        Some(br_readdir)
+        typed br_readdir as fn(&mut BridgeContext, u32) -> u32
     ),
-    entry!(0x60, func, "closedir", Some(br_closedir)),
-    entry!(0x64, func, "getLen", Some(br_mr_get_len)),
-    entry!(0x68, func, "drawBitmap", Some(br_mr_draw_bitmap)),
-    entry!(0x6C, func, "getHostByName", Some(br_mr_get_host_by_name)),
-    entry!(0x70, func, "initNetwork", Some(br_mr_init_network)),
-    entry!(0x74, func, "mr_closeNetwork", Some(br_mr_close_network)),
-    entry!(0x78, func, "mr_socket", Some(br_mr_socket)),
-    entry!(0x7C, func, "mr_connect", Some(br_mr_connect)),
+    entry!(0x60, func, "closedir", typed br_closedir as fn(&mut BridgeContext, u32) -> u32),
+    entry!(0x64, func, "getLen", typed br_mr_get_len as fn(&mut BridgeContext, ConstPtr<u8>) -> u32),
+    entry!(0x68, func, "drawBitmap", typed br_mr_draw_bitmap as fn(&mut BridgeContext, ConstPtr<u16>, u32, u32, u32, u32)),
+    entry!(0x6C, func, "getHostByName", typed br_mr_get_host_by_name as fn(&mut BridgeContext, ConstPtr<u8>, u32, u32) -> u32),
+    entry!(0x70, func, "initNetwork", typed br_mr_init_network as fn(&mut BridgeContext, u32, ConstPtr<u8>, u32) -> u32),
+    entry!(0x74, func, "mr_closeNetwork", typed br_mr_close_network as fn(&mut BridgeContext) -> u32),
+    entry!(0x78, func, "mr_socket", typed br_mr_socket as fn(&mut BridgeContext, u32, u32) -> u32),
+    entry!(0x7C, func, "mr_connect", typed br_mr_connect as fn(&mut BridgeContext, u32, u32, u32, u32) -> u32),
     entry!(
         0x80,
         func,
         "mr_getSocketState",
-        Some(br_mr_get_socket_state)
+        typed br_mr_get_socket_state as fn(&mut BridgeContext, u32) -> u32
     ),
-    entry!(0x84, func, "mr_closeSocket", Some(br_mr_close_socket)),
-    entry!(0x88, func, "mr_recv", Some(br_mr_recv)),
-    entry!(0x8C, func, "mr_send", Some(br_mr_send)),
-    entry!(0x90, func, "mr_recvfrom", Some(br_mr_recvfrom)),
-    entry!(0x94, func, "mr_sendto", Some(br_mr_sendto)),
-    entry!(0x98, func, "mr_startShake", Some(br_mr_start_shake)),
-    entry!(0x9C, func, "mr_stopShake", Some(br_mr_stop_shake)),
-    entry!(0xA0, func, "mr_playSound", Some(br_mr_play_sound)),
-    entry!(0xA4, func, "mr_stopSound", Some(br_mr_stop_sound)),
-    entry!(0xA8, func, "mr_dialogCreate", Some(br_return_failed)),
-    entry!(0xAC, func, "mr_dialogRelease", Some(br_return_failed)),
-    entry!(0xB0, func, "mr_dialogRefresh", Some(br_return_failed)),
-    entry!(0xB4, func, "mr_textCreate", Some(br_return_failed)),
-    entry!(0xB8, func, "mr_textRelease", Some(br_return_failed)),
-    entry!(0xBC, func, "mr_textRefresh", Some(br_return_failed)),
-    entry!(0xC0, func, "mr_editCreate", Some(br_mr_edit_create)),
-    entry!(0xC4, func, "mr_editRelease", Some(br_mr_edit_release)),
-    entry!(0xC8, func, "mr_editGetText", Some(br_mr_edit_get_text)),
+    entry!(0x84, func, "mr_closeSocket", typed br_mr_close_socket as fn(&mut BridgeContext, u32) -> u32),
+    entry!(0x88, func, "mr_recv", typed br_mr_recv as fn(&mut BridgeContext, u32, MutPtr<u8>, u32) -> u32),
+    entry!(0x8C, func, "mr_send", typed br_mr_send as fn(&mut BridgeContext, u32, ConstPtr<u8>, u32) -> u32),
+    entry!(0x90, func, "mr_recvfrom", typed br_mr_recvfrom as fn(&mut BridgeContext, u32, MutPtr<u8>, u32, MutPtr<c_int>, MutPtr<c_ushort>) -> u32),
+    entry!(0x94, func, "mr_sendto", typed br_mr_sendto as fn(&mut BridgeContext, u32, ConstPtr<u8>, u32, u32, u32) -> u32),
+    entry!(0x98, func, "mr_startShake", typed br_mr_start_shake as fn(&mut BridgeContext) -> u32),
+    entry!(0x9C, func, "mr_stopShake", typed br_mr_stop_shake as fn(&mut BridgeContext) -> u32),
+    entry!(0xA0, func, "mr_playSound", typed br_mr_play_sound as fn(&mut BridgeContext, u32, ConstPtr<u8>, u32, u32) -> u32),
+    entry!(0xA4, func, "mr_stopSound", typed br_mr_stop_sound as fn(&mut BridgeContext, u32) -> u32),
+    entry!(0xA8, func, "mr_dialogCreate", typed br_return_failed as fn(&mut BridgeContext) -> u32),
+    entry!(0xAC, func, "mr_dialogRelease", typed br_return_failed as fn(&mut BridgeContext) -> u32),
+    entry!(0xB0, func, "mr_dialogRefresh", typed br_return_failed as fn(&mut BridgeContext) -> u32),
+    entry!(0xB4, func, "mr_textCreate", typed br_return_failed as fn(&mut BridgeContext) -> u32),
+    entry!(0xB8, func, "mr_textRelease", typed br_return_failed as fn(&mut BridgeContext) -> u32),
+    entry!(0xBC, func, "mr_textRefresh", typed br_return_failed as fn(&mut BridgeContext) -> u32),
+    entry!(0xC0, func, "mr_editCreate", typed br_mr_edit_create as fn(&mut BridgeContext, ConstPtr<u8>, ConstPtr<u8>, u32, u32) -> u32),
+    entry!(0xC4, func, "mr_editRelease", typed br_mr_edit_release as fn(&mut BridgeContext, u32) -> u32),
+    entry!(0xC8, func, "mr_editGetText", typed br_mr_edit_get_text as fn(&mut BridgeContext, u32) -> u32),
 ];
 
 pub fn bridge_init(uc: *mut c_void, syscall: &mut Syscall) -> c_int {
