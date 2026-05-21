@@ -1,6 +1,7 @@
 pub(crate) mod bridge;
 
 use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MemRegion, MutPtr, MutVoidPtr, Ptr};
+use crate::syscall::Syscall;
 use crate::unicorn;
 use crate::{compat, file};
 use libc::{c_char, c_int, c_void};
@@ -34,16 +35,16 @@ pub struct Bootstrap {
 }
 
 impl Bootstrap {
-    pub fn start() -> Result<Self, c_int> {
-        let uc = init_runtime();
+    pub fn start(syscall: &mut Syscall) -> Result<Self, c_int> {
+        let uc = init_bootstrap(syscall);
         if uc.is_null() {
-            log!("init_runtime() fail.");
+            log!("init_bootstrap() fail.");
             return Err(MR_FAILED);
         }
 
         if load_code(uc) == MR_FAILED {
             log!("loadCode fail.");
-            free_runtime(uc);
+            free_bootstrap(uc);
             return Err(MR_FAILED);
         }
 
@@ -78,7 +79,7 @@ impl Bootstrap {
 
 impl Drop for Bootstrap {
     fn drop(&mut self) {
-        free_runtime(self.uc);
+        free_bootstrap(self.uc);
     }
 }
 
@@ -183,7 +184,7 @@ pub fn to_mrp_mem_addr(ptr: *mut c_void) -> u32 {
     })
 }
 
-pub fn free_runtime(uc: *mut c_void) -> c_int {
+pub fn free_bootstrap(uc: *mut c_void) -> c_int {
     unsafe {
         set_guest_mem(None);
         if !MRP_MEM.is_null() {
@@ -199,7 +200,7 @@ pub fn free_runtime(uc: *mut c_void) -> c_int {
     0
 }
 
-pub fn init_runtime() -> *mut c_void {
+pub fn init_bootstrap(syscall: &mut Syscall) -> *mut c_void {
     let mut engine = match unicorn::new_arm() {
         Ok(engine) => engine,
         Err(err) => {
@@ -243,14 +244,14 @@ pub fn init_runtime() -> *mut c_void {
     })();
 
     if map_result.is_err() {
-        free_runtime(uc);
+        free_bootstrap(uc);
         return ptr::null_mut();
     }
 
     let uc = unicorn::store_owner(engine);
 
     let init_result = (|| {
-        if bridge::bridge_init(uc) != MR_SUCCESS {
+        if bridge::bridge_init(uc, syscall) != MR_SUCCESS {
             log!("Failed bridge_init()");
             return Err(());
         }
@@ -300,7 +301,7 @@ pub fn init_runtime() -> *mut c_void {
     })();
 
     if init_result.is_err() {
-        free_runtime(uc);
+        free_bootstrap(uc);
         return ptr::null_mut();
     }
 
@@ -330,8 +331,4 @@ pub fn load_code(uc: *mut c_void) -> c_int {
         return MR_FAILED;
     }
     MR_SUCCESS
-}
-
-pub fn start_runtime() -> c_int {
-    Bootstrap::start().map(|_| MR_SUCCESS).unwrap_or(MR_FAILED)
 }

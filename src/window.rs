@@ -184,7 +184,7 @@ pub fn edit_get_text() -> *mut c_char {
     HOLD_EDIT_TEXT_PTR.lock().unwrap().0
 }
 
-fn saveEditText(s: &str) {
+fn save_edit_text(s: &str) {
     let max_size = *EDIT_MAX_SIZE.lock().unwrap();
     let mut count = 0;
     let mut byte_len = 0;
@@ -324,7 +324,7 @@ pub fn run() -> Result<(), String> {
                         || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD) =>
                     {
                         if let Ok(text) = canvas.window().subsystem().clipboard().clipboard_text() {
-                            saveEditText(&text);
+                            save_edit_text(&text);
                         }
                         env.event(MR_DIALOG_EVENT, 0, 0);
                     }

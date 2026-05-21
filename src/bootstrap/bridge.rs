@@ -1,7 +1,7 @@
 use crate::abi::{self, AbiReg, GuestArg, GuestRet, RegisterContext, StackMemoryContext};
 use crate::mem::{ConstPtr, GuestUSize, MutPtr, Ptr, SafeWrite};
 use crate::bootstrap;
-use crate::syscall;
+use crate::syscall::{self, Syscall};
 use crate::unicorn;
 use crate::{compat, file, network, window};
 use libc::{c_char, c_int, c_ushort, c_void};
@@ -276,7 +276,12 @@ fn dispatch_bridge_svc(uc: *mut c_void, svc: u32, entry: usize) {
     );
 }
 
-fn hooks_init(uc: *mut c_void, map: &'static [BridgeEntry], table_size: u32) -> *mut c_void {
+fn hooks_init(
+    uc: *mut c_void,
+    syscall: &mut Syscall,
+    map: &'static [BridgeEntry],
+    table_size: u32,
+) -> *mut c_void {
     let func_count = map
         .iter()
         .filter(|obj| obj.type_ == BridgeMapType::Func)
@@ -297,7 +302,7 @@ fn hooks_init(uc: *mut c_void, map: &'static [BridgeEntry], table_size: u32) -> 
                 if let Some(init) = obj.init {
                     init(obj, uc, addr);
                 }
-                let svc = syscall::link_host_function(
+                let svc = syscall.link_host_function(
                     uc,
                     stub_address,
                     obj.name,
@@ -955,14 +960,14 @@ static DSM_REQUIRE_FUNCS_MAP: &[BridgeEntry] = &[
     entry!(0xC8, func, "mr_editGetText", Some(br_mr_edit_get_text)),
 ];
 
-pub fn bridge_init(uc: *mut c_void) -> c_int {
-    syscall::ensure_unicorn_svc_hook(uc);
+pub fn bridge_init(uc: *mut c_void, syscall: &mut Syscall) -> c_int {
+    syscall.ensure_unicorn_svc_hook(uc);
 
     let len = 4 * MR_TABLE_FUNC_MAP.len() as u32;
     unsafe {
-        MR_TABLE = hooks_init(uc, MR_TABLE_FUNC_MAP, len);
+        MR_TABLE = hooks_init(uc, syscall, MR_TABLE_FUNC_MAP, len);
 
-        DSM_REQUIRE_FUNCS = hooks_init(uc, DSM_REQUIRE_FUNCS_MAP, DSM_REQUIRE_FUNCS_SIZE);
+        DSM_REQUIRE_FUNCS = hooks_init(uc, syscall, DSM_REQUIRE_FUNCS_MAP, DSM_REQUIRE_FUNCS_SIZE);
     }
     let dsm_require_funcs = unsafe { DSM_REQUIRE_FUNCS };
     let flags_addr = bootstrap::to_mrp_mem_addr(dsm_require_funcs) + 0xcc;

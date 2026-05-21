@@ -1,6 +1,6 @@
 use libc::c_void;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::{cell::RefCell, rc::Rc};
 use unicorn_engine::RegisterARM;
 
 use crate::{
@@ -19,8 +19,11 @@ struct LinkedHostCall {
     user_data: usize,
 }
 
-static LINKED_HOST_FUNCTIONS: OnceLock<Mutex<HashMap<u32, LinkedHostCall>>> = OnceLock::new();
-static INSTALLED_SVC_HOOKS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+#[derive(Default)]
+struct SyscallState {
+    linked_host_functions: Vec<LinkedHostCall>,
+    installed_svc_hooks: HashSet<usize>,
+}
 
 fn encode_a32_svc(imm: u32) -> u32 {
     assert!(imm & 0xff000000 == 0);
@@ -47,14 +50,6 @@ fn write_return_to_host_routine(mem: &mut Mem, svc: u32) -> GuestFunction {
     let ptr = GuestFunction::from_addr_with_thumb_bit(ptr.to_bits());
     assert!(!ptr.is_thumb());
     ptr
-}
-
-fn linked_host_functions() -> &'static Mutex<HashMap<u32, LinkedHostCall>> {
-    LINKED_HOST_FUNCTIONS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn installed_svc_hooks() -> &'static Mutex<HashSet<usize>> {
-    INSTALLED_SVC_HOOKS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn write_linked_host_function_stub(uc: *mut c_void, addr: u32, svc: u32) {
@@ -135,7 +130,7 @@ fn decode_svc(uc: *mut c_void) -> Option<u32> {
     }
 }
 
-fn dispatch_svc(uc: *mut c_void, svc: u32) {
+fn dispatch_svc(state: &Rc<RefCell<SyscallState>>, uc: *mut c_void, svc: u32) {
     let pc = unicorn::reg_read(uc, RegisterARM::PC).unwrap_or(0);
     let lr = unicorn::reg_read(uc, RegisterARM::LR).unwrap_or(0);
     let sp = unicorn::reg_read(uc, RegisterARM::SP).unwrap_or(0);
@@ -147,7 +142,9 @@ fn dispatch_svc(uc: *mut c_void, svc: u32) {
         "[SVC] dispatch svc=#{svc} pc=0x{pc:08X} lr=0x{lr:08X} sp=0x{sp:08X} args=[0x{r0:08X}, 0x{r1:08X}, 0x{r2:08X}, 0x{r3:08X}]"
     );
 
-    let linked = linked_host_functions().lock().unwrap().get(&svc).copied();
+    let linked = svc
+        .checked_sub(Syscall::SVC_LINKED_FUNCTIONS_BASE)
+        .and_then(|idx| state.borrow().linked_host_functions.get(idx as usize).copied());
     let Some(linked) = linked else {
         log!("!!! unknown SVC #{svc} !!!");
         return;
@@ -164,61 +161,16 @@ fn dispatch_svc(uc: *mut c_void, svc: u32) {
     );
 }
 
-fn hook_svc(uc: *mut c_void) {
+fn hook_svc(state: &Rc<RefCell<SyscallState>>, uc: *mut c_void) {
     let Some(svc) = decode_svc(uc) else {
         log!("!!! failed to decode SVC !!!");
         return;
     };
-    dispatch_svc(uc, svc);
-}
-
-pub fn ensure_unicorn_svc_hook(uc: *mut c_void) {
-    let handle = uc as usize;
-    {
-        let hooks = installed_svc_hooks().lock().unwrap();
-        if hooks.contains(&handle) {
-            return;
-        }
-    }
-
-    if let Err(err) = unicorn::add_intr_hook(uc, |engine, _intno| {
-        hook_svc(engine.get_handle().cast::<c_void>());
-    }) {
-        log!("add SVC hook err {err:?} ({})", unicorn::error_text(err));
-        std::process::exit(1);
-    }
-
-    installed_svc_hooks().lock().unwrap().insert(handle);
-}
-
-pub fn link_host_function(
-    uc: *mut c_void,
-    stub_addr: u32,
-    name: &'static str,
-    dispatch: LinkedHostFunction,
-    user_data: usize,
-) -> u32 {
-    let mut functions = linked_host_functions().lock().unwrap();
-    let svc = Syscall::SVC_LINKED_FUNCTIONS_BASE + functions.len() as u32;
-    write_linked_host_function_stub(uc, stub_addr, svc);
-    if functions
-        .insert(
-            svc,
-            LinkedHostCall {
-                name,
-                dispatch,
-                user_data,
-            },
-        )
-        .is_some()
-    {
-        log!("linked host function insert failed SVC #{svc} exists.");
-        std::process::exit(1);
-    }
-    svc
+    dispatch_svc(state, uc, svc);
 }
 
 pub struct Syscall {
+    state: Rc<RefCell<SyscallState>>,
     return_to_host_routine: Option<GuestFunction>,
     thread_exit_routine: Option<GuestFunction>,
     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
@@ -235,6 +187,7 @@ impl Syscall {
 
     pub fn new() -> Self {
         Self {
+            state: Rc::new(RefCell::new(SyscallState::default())),
             return_to_host_routine: None,
             thread_exit_routine: None,
             non_lazy_host_functions: HashMap::new(),
@@ -247,5 +200,41 @@ impl Syscall {
 
     pub fn thread_exit_routine(&self) -> GuestFunction {
         self.thread_exit_routine.unwrap()
+    }
+
+    pub fn ensure_unicorn_svc_hook(&mut self, uc: *mut c_void) {
+        let handle = uc as usize;
+        if self.state.borrow().installed_svc_hooks.contains(&handle) {
+            return;
+        }
+
+        let state = self.state.clone();
+        if let Err(err) = unicorn::add_intr_hook(uc, move |engine, _intno| {
+            hook_svc(&state, engine.get_handle().cast::<c_void>());
+        }) {
+            log!("add SVC hook err {err:?} ({})", unicorn::error_text(err));
+            std::process::exit(1);
+        }
+
+        self.state.borrow_mut().installed_svc_hooks.insert(handle);
+    }
+
+    pub fn link_host_function(
+        &mut self,
+        uc: *mut c_void,
+        stub_addr: u32,
+        name: &'static str,
+        dispatch: LinkedHostFunction,
+        user_data: usize,
+    ) -> u32 {
+        let mut state = self.state.borrow_mut();
+        let svc = Self::SVC_LINKED_FUNCTIONS_BASE + state.linked_host_functions.len() as u32;
+        write_linked_host_function_stub(uc, stub_addr, svc);
+        state.linked_host_functions.push(LinkedHostCall {
+            name,
+            dispatch,
+            user_data,
+        });
+        svc
     }
 }

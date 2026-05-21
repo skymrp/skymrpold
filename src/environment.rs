@@ -62,7 +62,7 @@ impl Environment {
     }
 
     pub fn start(&mut self) -> Result<(), String> {
-        let bootstrap = bootstrap::Bootstrap::start()
+        let bootstrap = bootstrap::Bootstrap::start(&mut self.syscall)
             .map_err(|code| format!("bootstrap start failed with code {code}"))?;
         self.bootstrap = Some(bootstrap);
         Ok(())
