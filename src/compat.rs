@@ -1,6 +1,6 @@
 use crate::file;
 use crate::mem::{MutPtr, MutVoidPtr, Ptr};
-use crate::runtime;
+use crate::bootstrap;
 use crate::unicorn;
 use libc::{c_char, c_int, c_uchar, c_void, size_t};
 use std::cell::RefCell;
@@ -127,7 +127,7 @@ fn alloc_guest(len: u32) -> Option<u32> {
     unsafe {
         LG_mem_left = LG_mem_left.saturating_sub(len);
         LG_mem_min = LG_mem_min.min(LG_mem_left);
-        LG_mem_top = LG_mem_top.max(addr.saturating_sub(runtime::to_mrp_mem_addr(LG_mem_base.cast())));
+        LG_mem_top = LG_mem_top.max(addr.saturating_sub(bootstrap::to_mrp_mem_addr(LG_mem_base.cast())));
     }
     Some(addr)
 }
@@ -143,13 +143,13 @@ fn free_guest(addr: u32) {
 }
 
 fn guest_host_ptr(addr: u32, count: u32) -> *mut c_void {
-    runtime::guest_host_ptr_mut(addr, count)
+    bootstrap::guest_host_ptr_mut(addr, count)
 }
 
 pub fn init_memory_manager(base_address: u32, len: u32) {
     log!("init_memory_manager: baseAddress:0x{base_address:X} len: 0x{len:X}");
     unsafe {
-        Origin_LG_mem_base = runtime::guest_host_ptr_mut(base_address, 1) as *mut c_char;
+        Origin_LG_mem_base = bootstrap::guest_host_ptr_mut(base_address, 1) as *mut c_char;
         Origin_LG_mem_len = len;
 
         LG_mem_base = ((Origin_LG_mem_base.add(3) as usize) & !3usize) as *mut c_char;
@@ -162,7 +162,7 @@ pub fn init_memory_manager(base_address: u32, len: u32) {
         FREE_LIST.with(|free_list| {
             free_list
                 .borrow_mut()
-                .init(runtime::to_mrp_mem_addr(LG_mem_base.cast()), LG_mem_len);
+                .init(bootstrap::to_mrp_mem_addr(LG_mem_base.cast()), LG_mem_len);
         });
     }
 }
@@ -210,7 +210,7 @@ pub extern "C" fn my_free(p: *mut c_void, _len: u32) {
     if p.is_null() {
         return;
     }
-    let addr = runtime::to_mrp_mem_addr(p);
+    let addr = bootstrap::to_mrp_mem_addr(p);
     free_guest(addr);
 }
 
@@ -223,14 +223,14 @@ pub extern "C" fn my_realloc(p: *mut c_void, oldlen: u32, len: u32) -> *mut c_vo
         my_free(p, oldlen);
         return ptr::null_mut();
     }
-    let old_addr = runtime::to_mrp_mem_addr(p);
+    let old_addr = bootstrap::to_mrp_mem_addr(p);
     let new_len = real_lg_mem_size(len);
     let Some((new_addr, old_len)) =
         FREE_LIST.with(|free_list| free_list.borrow_mut().realloc(old_addr, new_len))
     else {
         return ptr::null_mut();
     };
-    runtime::with_guest_mem_mut(|mem| {
+    bootstrap::with_guest_mem_mut(|mem| {
         mem.memmove(
             MutPtr::<c_void>::from_bits(new_addr),
             Ptr::<c_void, false>::from_bits(old_addr),
@@ -258,7 +258,7 @@ pub fn malloc_ext_guest(len: u32) -> MutVoidPtr {
         return MutVoidPtr::null();
     };
     let header = MutPtr::<u32>::from_bits(header_addr);
-    runtime::with_guest_mem_mut(|mem| mem.write(header, len));
+    bootstrap::with_guest_mem_mut(|mem| mem.write(header, len));
     MutVoidPtr::from_bits(header_addr + size_of::<u32>() as u32)
 }
 
@@ -278,7 +278,7 @@ pub fn malloc_ext_zeroed(len: u32) -> *mut c_void {
 pub fn malloc_ext_zeroed_guest(len: u32) -> MutVoidPtr {
     let ptr = malloc_ext_guest(len);
     if !ptr.is_null() {
-        runtime::with_guest_mem_mut(|mem| {
+        bootstrap::with_guest_mem_mut(|mem| {
             mem.bytes_at_mut(ptr.cast::<u8>(), len).fill(0);
         });
     }
@@ -294,7 +294,7 @@ pub fn free_ext(p: *mut c_void) {
     if p.is_null() {
         return;
     }
-    let payload = runtime::to_mrp_mem_addr(p);
+    let payload = bootstrap::to_mrp_mem_addr(p);
     free_ext_guest(MutVoidPtr::from_bits(payload));
 }
 
@@ -304,7 +304,7 @@ pub fn free_ext_guest(ptr: MutVoidPtr) {
         return;
     }
     let header = MutPtr::<u32>::from_bits(payload - size_of::<u32>() as u32);
-    let _len: u32 = runtime::with_guest_mem(|mem| mem.read(header.cast_const()));
+    let _len: u32 = bootstrap::with_guest_mem(|mem| mem.read(header.cast_const()));
     free_guest(header.to_bits());
 }
 
@@ -317,7 +317,7 @@ pub fn realloc_ext(p: *mut c_void, new_len: u32) -> *mut c_void {
     let ptr = if p.is_null() {
         MutVoidPtr::null()
     } else {
-        MutVoidPtr::from_bits(runtime::to_mrp_mem_addr(p))
+        MutVoidPtr::from_bits(bootstrap::to_mrp_mem_addr(p))
     };
     let new_ptr = realloc_ext_guest(ptr, new_len);
     if new_ptr.is_null() {
@@ -336,12 +336,12 @@ pub fn realloc_ext_guest(ptr: MutVoidPtr, new_len: u32) -> MutVoidPtr {
         return MutVoidPtr::null();
     }
     let header = MutPtr::<u32>::from_bits(payload - size_of::<u32>() as u32);
-    let old_len = runtime::with_guest_mem(|mem| mem.read(header.cast_const()));
+    let old_len = bootstrap::with_guest_mem(|mem| mem.read(header.cast_const()));
     let new_block = malloc_ext_guest(new_len);
     if new_block.is_null() {
         return new_block;
     }
-    runtime::with_guest_mem_mut(|mem| {
+    bootstrap::with_guest_mem_mut(|mem| {
         mem.memmove(
             new_block,
             Ptr::<c_void, false>::from_bits(payload),
@@ -548,7 +548,7 @@ pub extern "C" fn copyWstrToMrp(str_: *mut c_char) -> u32 {
             return 0;
         }
         ptr::copy_nonoverlapping(str_ as *const u8, p as *mut u8, len);
-        runtime::to_mrp_mem_addr(p)
+        bootstrap::to_mrp_mem_addr(p)
     }
 }
 
@@ -563,7 +563,7 @@ pub fn copy_str_to_mrp(str_: *mut c_char) -> u32 {
             return 0;
         }
         ptr::copy_nonoverlapping(str_ as *const u8, p as *mut u8, len);
-        runtime::to_mrp_mem_addr(p)
+        bootstrap::to_mrp_mem_addr(p)
     }
 }
 

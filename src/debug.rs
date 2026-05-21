@@ -1,4 +1,4 @@
-use crate::{compat, file, runtime, unicorn};
+use crate::{bootstrap, compat, file, unicorn};
 use libc::{c_char, c_void};
 use std::ffi::{CStr, CString};
 use std::io::{self, Write};
@@ -72,7 +72,7 @@ fn dump_file(command: &str) {
     let addr = to_u32(addr);
     let len = to_u32(len);
     unsafe {
-        file::writeFile(filename.as_ptr(), runtime::get_mrp_mem_ptr(addr), len);
+        file::writeFile(filename.as_ptr(), bootstrap::get_mrp_mem_ptr(addr), len);
     }
 }
 

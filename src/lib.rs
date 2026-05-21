@@ -1,9 +1,8 @@
 #[macro_use]
 mod log;
 mod abi;
-mod app;
 pub mod audio;
-mod bridge;
+mod bootstrap;
 mod compat;
 mod cpu;
 mod debug;
@@ -16,14 +15,12 @@ mod mrp;
 mod network;
 mod options;
 mod paths;
-mod runtime;
 mod syscall;
 mod unicorn;
 mod window;
 
-pub use app::run as run_app;
+pub use window::run as run_app;
 use environment::Environment;
-pub use runtime::{event, start_runtime, timer};
 pub use skymrp_version::*;
 
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {

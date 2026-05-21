@@ -1,7 +1,7 @@
 mod nullable_box;
 use std::time::Instant;
 
-use crate::{cpu, environment::nullable_box::NullableBox, gdb, mem, options, syscall};
+use crate::{bootstrap, cpu, environment::nullable_box::NullableBox, gdb, mem, options, syscall};
 
 /// The struct containing the entire emulator state. Methods are provided for
 /// execution and management of threads.
@@ -11,6 +11,7 @@ pub struct Environment {
     pub mem: NullableBox<mem::Mem>,
     pub cpu: NullableBox<Box<dyn cpu::CpuBackend>>,
     pub syscall: NullableBox<syscall::Syscall>,
+    pub bootstrap: Option<bootstrap::Bootstrap>,
     remaining_ticks: Option<u64>,
     gdb_server: Option<Box<gdb::GdbServer>>,
 }
@@ -44,6 +45,7 @@ impl Environment {
             mem: NullableBox::new(mem),
             cpu: NullableBox::new(cpu),
             syscall: NullableBox::new(syscall),
+            bootstrap: None,
             gdb_server: None,
             remaining_ticks: None,
         };
@@ -57,6 +59,25 @@ impl Environment {
     /// Only `main.rs` should call this.
     pub fn run(mut self) {
         loop {}
+    }
+
+    pub fn start(&mut self) -> Result<(), String> {
+        let bootstrap = bootstrap::Bootstrap::start()
+            .map_err(|code| format!("bootstrap start failed with code {code}"))?;
+        self.bootstrap = Some(bootstrap);
+        Ok(())
+    }
+
+    pub fn event(&mut self, code: i32, p1: i32, p2: i32) -> i32 {
+        self.bootstrap
+            .as_mut()
+            .map_or(-1, |bootstrap| bootstrap.event(code, p1, p2))
+    }
+
+    pub fn timer(&mut self) -> i32 {
+        self.bootstrap
+            .as_mut()
+            .map_or(-1, bootstrap::Bootstrap::timer)
     }
 
     /// Run the emulator until the app returns control to the host. This is for

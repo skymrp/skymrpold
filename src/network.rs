@@ -1,4 +1,4 @@
-use crate::bridge;
+use crate::bootstrap::bridge;
 use libc::{c_char, c_int, c_ushort, c_void};
 use std::collections::HashMap;
 use std::ffi::CStr;

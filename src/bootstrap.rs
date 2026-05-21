@@ -1,6 +1,8 @@
+pub(crate) mod bridge;
+
 use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MemRegion, MutPtr, MutVoidPtr, Ptr};
 use crate::unicorn;
-use crate::{bridge, compat, file};
+use crate::{compat, file};
 use libc::{c_char, c_int, c_void};
 use std::cell::RefCell;
 use std::ffi::CStr;
@@ -23,10 +25,61 @@ const TOTAL_MEMORY: u32 = END_ADDRESS - START_ADDRESS;
 
 static mut MRP_MEM: *mut u8 = ptr::null_mut();
 static mut LOW_MEM: *mut u8 = ptr::null_mut();
-static mut UC: *mut c_void = ptr::null_mut();
-
 thread_local! {
     static GUEST_MEM: RefCell<Option<Mem>> = const { RefCell::new(None) };
+}
+
+pub struct Bootstrap {
+    uc: *mut c_void,
+}
+
+impl Bootstrap {
+    pub fn start() -> Result<Self, c_int> {
+        let uc = init_runtime();
+        if uc.is_null() {
+            log!("init_runtime() fail.");
+            return Err(MR_FAILED);
+        }
+
+        if load_code(uc) == MR_FAILED {
+            log!("loadCode fail.");
+            free_runtime(uc);
+            return Err(MR_FAILED);
+        }
+
+        bridge::bridge_ext_init(uc);
+
+        if bridge::bridge_dsm_init(uc) == MR_SUCCESS {
+            log!("bridge_dsm_init success");
+            compat::dump_reg(uc);
+
+            let filename = b"dsm_gm.mrp\0";
+            let ext_name = b"start.mr\0";
+            let ret = bridge::bridge_dsm_mr_start_dsm(
+                uc,
+                filename.as_ptr() as *mut c_char,
+                ext_name.as_ptr() as *mut c_char,
+                ptr::null_mut(),
+            );
+            log!("bridge_dsm_mr_start_dsm('dsm_gm.mrp','start.mr',NULL): 0x{ret:X}");
+        }
+
+        Ok(Self { uc })
+    }
+
+    pub fn event(&mut self, code: c_int, p1: c_int, p2: c_int) -> c_int {
+        bridge::bridge_dsm_mr_event(self.uc, code, p1, p2)
+    }
+
+    pub fn timer(&mut self) -> c_int {
+        bridge::bridge_dsm_mr_timer(self.uc)
+    }
+}
+
+impl Drop for Bootstrap {
+    fn drop(&mut self) {
+        free_runtime(self.uc);
+    }
 }
 
 fn set_guest_mem(mem: Option<Mem>) {
@@ -142,9 +195,6 @@ pub fn free_runtime(uc: *mut c_void) -> c_int {
             LOW_MEM = ptr::null_mut();
         }
         unicorn::clear_owner(uc);
-        if UC == uc {
-            UC = ptr::null_mut();
-        }
     }
     0
 }
@@ -257,25 +307,7 @@ pub fn init_runtime() -> *mut c_void {
     uc
 }
 
-pub fn event(code: c_int, p1: c_int, p2: c_int) -> c_int {
-    unsafe {
-        if !UC.is_null() {
-            return bridge::bridge_dsm_mr_event(UC, code, p1, p2);
-        }
-    }
-    MR_FAILED
-}
-
-pub fn timer() -> c_int {
-    unsafe {
-        if !UC.is_null() {
-            return bridge::bridge_dsm_mr_timer(UC);
-        }
-    }
-    MR_FAILED
-}
-
-pub fn load_code() -> c_int {
+pub fn load_code(uc: *mut c_void) -> c_int {
     let filename = b"mythroad/cfunction.ext\0";
     let filename = CStr::from_bytes_with_nul(filename).expect("static filename has trailing NUL");
     let data = match file::read_file_cstr(filename) {
@@ -289,7 +321,6 @@ pub fn load_code() -> c_int {
         }
     };
 
-    let uc = unsafe { UC };
     let err = unicorn::mem_write(uc, CODE_ADDRESS as u64, &data);
     if let Err(err) = err {
         log!(
@@ -302,35 +333,5 @@ pub fn load_code() -> c_int {
 }
 
 pub fn start_runtime() -> c_int {
-    unsafe {
-        UC = init_runtime();
-        if UC.is_null() {
-            log!("init_runtime() fail.");
-            return MR_FAILED;
-        }
-
-        if load_code() == MR_FAILED {
-            log!("loadCode fail.");
-            return MR_FAILED;
-        }
-
-        bridge::bridge_ext_init(UC);
-
-        if bridge::bridge_dsm_init(UC) == MR_SUCCESS {
-            log!("bridge_dsm_init success");
-            compat::dump_reg(UC);
-
-            let filename = b"dsm_gm.mrp\0";
-            let ext_name = b"start.mr\0";
-            let ret = bridge::bridge_dsm_mr_start_dsm(
-                UC,
-                filename.as_ptr() as *mut c_char,
-                ext_name.as_ptr() as *mut c_char,
-                ptr::null_mut(),
-            );
-            log!("bridge_dsm_mr_start_dsm('dsm_gm.mrp','start.mr',NULL): 0x{ret:X}");
-        }
-
-        MR_SUCCESS
-    }
+    Bootstrap::start().map(|_| MR_SUCCESS).unwrap_or(MR_FAILED)
 }
