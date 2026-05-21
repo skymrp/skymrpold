@@ -13,10 +13,16 @@ pub type HostFunction = &'static dyn CallFromGuest;
 pub type LinkedHostFunction = fn(*mut c_void, u32, usize);
 
 #[derive(Clone, Copy)]
-struct LinkedHostCall {
+struct LegacyHostCall {
     name: &'static str,
     dispatch: LinkedHostFunction,
     user_data: usize,
+}
+
+#[derive(Clone, Copy)]
+enum LinkedHostCall {
+    Legacy(LegacyHostCall),
+    Typed(&'static str, HostFunction),
 }
 
 #[derive(Default)]
@@ -144,9 +150,20 @@ fn dispatch_svc(state: &Rc<RefCell<SyscallState>>, uc: *mut c_void, svc: u32) {
 
     let linked = svc
         .checked_sub(Syscall::SVC_LINKED_FUNCTIONS_BASE)
-        .and_then(|idx| state.borrow().linked_host_functions.get(idx as usize).copied());
+        .and_then(|idx| {
+            state
+                .borrow()
+                .linked_host_functions
+                .get(idx as usize)
+                .copied()
+        });
     let Some(linked) = linked else {
         log!("!!! unknown SVC #{svc} !!!");
+        return;
+    };
+
+    let LinkedHostCall::Legacy(linked) = linked else {
+        log!("!!! SVC #{svc} is a typed host function and must be handled by Environment !!!");
         return;
     };
 
@@ -194,6 +211,12 @@ impl Syscall {
         }
     }
 
+    pub fn initialize_process(&mut self, mem: &mut Mem) {
+        self.return_to_host_routine =
+            Some(write_return_to_host_routine(mem, Self::SVC_RETURN_TO_HOST));
+        self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
+    }
+
     pub fn return_to_host_routine(&self) -> GuestFunction {
         self.return_to_host_routine.unwrap()
     }
@@ -230,11 +253,80 @@ impl Syscall {
         let mut state = self.state.borrow_mut();
         let svc = Self::SVC_LINKED_FUNCTIONS_BASE + state.linked_host_functions.len() as u32;
         write_linked_host_function_stub(uc, stub_addr, svc);
-        state.linked_host_functions.push(LinkedHostCall {
-            name,
-            dispatch,
-            user_data,
-        });
+        state
+            .linked_host_functions
+            .push(LinkedHostCall::Legacy(LegacyHostCall {
+                name,
+                dispatch,
+                user_data,
+            }));
         svc
+    }
+
+    pub fn link_typed_host_function(
+        &mut self,
+        mem: &mut Mem,
+        stub_addr: u32,
+        name: &'static str,
+        function: HostFunction,
+    ) -> u32 {
+        let mut state = self.state.borrow_mut();
+        let svc = Self::SVC_LINKED_FUNCTIONS_BASE + state.linked_host_functions.len() as u32;
+        let ptr = MutPtr::<u32>::from_bits(stub_addr);
+        mem.write(ptr + 0, encode_a32_svc(svc));
+        mem.write(ptr + 1, encode_a32_ret());
+        state
+            .linked_host_functions
+            .push(LinkedHostCall::Typed(name, function));
+        svc
+    }
+
+    /// Return the host function for a linked SVC, matching touchHLE's dyld
+    /// dispatch shape. Legacy entries are still handled by the Unicorn hook
+    /// while the bootstrap path is being migrated.
+    pub fn get_svc_handler(&mut self, svc_pc: u32, svc: u32) -> Option<HostFunction> {
+        match svc {
+            Self::SVC_THREAD_EXIT | Self::SVC_RETURN_TO_HOST => unreachable!(),
+            Self::SVC_LINKED_FUNCTIONS_BASE.. => {
+                let linked = svc
+                    .checked_sub(Self::SVC_LINKED_FUNCTIONS_BASE)
+                    .and_then(|idx| {
+                        self.state
+                            .borrow()
+                            .linked_host_functions
+                            .get(idx as usize)
+                            .copied()
+                    });
+                let Some(linked) = linked else {
+                    panic!("Unexpected SVC #{svc} at {svc_pc:#x}");
+                };
+                match linked {
+                    LinkedHostCall::Typed(name, function) => {
+                        log_dbg!("Call to typed host function: {}", name);
+                        Some(function)
+                    }
+                    LinkedHostCall::Legacy(call) => {
+                        log_dbg!(
+                            "SVC #{} at {svc_pc:#x} is legacy host function: {}",
+                            svc,
+                            call.name
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn create_guest_function(
+        &mut self,
+        mem: &mut Mem,
+        name: &'static str,
+        function: HostFunction,
+    ) -> GuestFunction {
+        let function_ptr = mem.alloc(8);
+        let function_ptr: MutPtr<u32> = function_ptr.cast();
+        self.link_typed_host_function(mem, function_ptr.to_bits(), name, function);
+        GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
     }
 }

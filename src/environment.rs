@@ -33,12 +33,14 @@ impl Environment {
 
         let mut mem = mem::Mem::new();
 
-        let cpu: Box<dyn cpu::CpuBackend> = Box::new(cpu::UnicornCpu::new(match options.direct_memory_access {
-            true => Some(&mut mem),
-            false => None,
-        }));
+        let cpu: Box<dyn cpu::CpuBackend> =
+            Box::new(cpu::UnicornCpu::new(match options.direct_memory_access {
+                true => Some(&mut mem),
+                false => None,
+            }));
 
-        let syscall = syscall::Syscall::new();
+        let mut syscall = syscall::Syscall::new();
+        syscall.initialize_process(&mut mem);
 
         let mut env = Environment {
             startup_time,
@@ -201,7 +203,11 @@ impl Environment {
                         unimplemented!("TODO: implement exit routines for threads!")
                     }
                     syscall::Syscall::SVC_LINKED_FUNCTIONS_BASE.. => {
-                        self.cpu.regs_mut()[cpu::Cpu::PC] = svc_pc;
+                        if let Some(function) = self.syscall.get_svc_handler(svc_pc, svc) {
+                            function.call_from_guest(self);
+                        } else {
+                            self.cpu.regs_mut()[cpu::Cpu::PC] = svc_pc;
+                        }
                         NextAction::Continue
                     }
                 }
