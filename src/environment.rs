@@ -12,6 +12,7 @@ pub struct Environment {
     pub cpu: NullableBox<Box<dyn cpu::CpuBackend>>,
     pub syscall: NullableBox<syscall::Syscall>,
     pub bootstrap: Option<bootstrap::Bootstrap>,
+    direct_memory_access: bool,
     remaining_ticks: Option<u64>,
     gdb_server: Option<Box<gdb::GdbServer>>,
 }
@@ -28,16 +29,12 @@ enum NextAction {
 
 impl Environment {
     /// Loads the binary and sets up the emulator.
-    pub fn new(mut options: options::Options) -> Result<Environment, String> {
+    pub fn new(options: options::Options) -> Result<Environment, String> {
         let startup_time = Instant::now();
 
         let mut mem = mem::Mem::new();
 
-        let cpu: Box<dyn cpu::CpuBackend> =
-            Box::new(cpu::UnicornCpu::new(match options.direct_memory_access {
-                true => Some(&mut mem),
-                false => None,
-            }));
+        let cpu: Box<dyn cpu::CpuBackend> = Box::new(cpu::UnicornCpu::new(None));
 
         let mut syscall = syscall::Syscall::new();
         syscall.initialize_process(&mut mem);
@@ -48,6 +45,7 @@ impl Environment {
             cpu: NullableBox::new(cpu),
             syscall: NullableBox::new(syscall),
             bootstrap: None,
+            direct_memory_access: options.direct_memory_access,
             gdb_server: None,
             remaining_ticks: None,
         };
@@ -68,6 +66,16 @@ impl Environment {
             .map_err(|code| format!("bootstrap start failed with code {code}"))?;
         self.bootstrap = Some(bootstrap);
         Ok(())
+    }
+
+    pub fn rebuild_cpu_for_current_memory(&mut self) {
+        let cpu: Box<dyn cpu::CpuBackend> =
+            Box::new(cpu::UnicornCpu::new(match self.direct_memory_access {
+                true => Some(&mut self.mem),
+                false => None,
+            }));
+        self.cpu = NullableBox::new(cpu);
+        self.cpu.set_cpsr(cpu::Cpu::CPSR_USER_MODE);
     }
 
     pub fn event(&mut self, code: i32, p1: i32, p2: i32) -> i32 {

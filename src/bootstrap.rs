@@ -37,6 +37,7 @@ impl Bootstrap {
     pub fn start(env: &mut Environment) -> Result<Self, c_int> {
         env.mem = crate::environment::nullable_box::NullableBox::new(new_bootstrap_mem());
         env.syscall.initialize_process(&mut env.mem);
+        env.rebuild_cpu_for_current_memory();
 
         let uc = init_bootstrap(env);
         if uc.is_null() {
