@@ -1,4 +1,4 @@
-mod nullable_box;
+pub(crate) mod nullable_box;
 use std::time::Instant;
 
 use crate::{bootstrap, cpu, environment::nullable_box::NullableBox, gdb, mem, options, syscall};
@@ -64,7 +64,7 @@ impl Environment {
     }
 
     pub fn start(&mut self) -> Result<(), String> {
-        let bootstrap = bootstrap::Bootstrap::start(&mut self.syscall)
+        let bootstrap = bootstrap::Bootstrap::start(self)
             .map_err(|code| format!("bootstrap start failed with code {code}"))?;
         self.bootstrap = Some(bootstrap);
         Ok(())

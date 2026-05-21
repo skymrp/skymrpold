@@ -220,7 +220,7 @@ impl MemRegion {
         }
     }
 
-    fn new_owned(guest_base: VAddr, len: GuestUSize) -> MemRegion {
+    pub fn new_owned(guest_base: VAddr, len: GuestUSize) -> MemRegion {
         let host_base =
             unsafe { crate::mem::host::allocate_memory(len as usize).unwrap() }.cast::<u8>();
         let host_base = NonNull::new(host_base).expect("host memory allocation returned null");
@@ -426,6 +426,25 @@ impl Mem {
     /// guest memory.
     pub unsafe fn direct_memory_access_ptr(&mut self) -> *mut std::ffi::c_void {
         self.regions[0].host_base.as_ptr().cast()
+    }
+
+    /// Get all regions suitable for CPU direct memory mapping.
+    ///
+    /// Safety: Returned host pointers must not outlive this [Mem], and the CPU
+    /// backend must only execute while the corresponding [Mem] is borrowed.
+    pub unsafe fn direct_memory_access_regions(
+        &self,
+    ) -> Vec<(VAddr, GuestUSize, *mut std::ffi::c_void)> {
+        self.regions
+            .iter()
+            .map(|region| {
+                (
+                    region.guest_base,
+                    region.len,
+                    region.host_base.as_ptr().cast(),
+                )
+            })
+            .collect()
     }
 
     pub fn direct_memory_access_base(&self) -> VAddr {

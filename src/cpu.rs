@@ -365,7 +365,7 @@ pub struct UnicornCpu {
     regs: [u32; 16],
     cpsr: u32,
     pending_state: Rc<Cell<Option<CpuState>>>,
-    mapped_memory: Option<MappedMemory>,
+    mapped_memory: Vec<MappedMemory>,
 }
 
 impl UnicornCpu {
@@ -381,7 +381,7 @@ impl UnicornCpu {
             regs: [0; 16],
             cpsr: Cpu::CPSR_USER_MODE,
             pending_state,
-            mapped_memory: None,
+            mapped_memory: Vec::new(),
         };
 
         if let Some(mem) = direct_memory_access {
@@ -396,33 +396,53 @@ impl UnicornCpu {
     }
 
     fn ensure_memory_mapped(&mut self, mem: &mut Mem) {
-        let base = mem.direct_memory_access_base();
-        let len = mem.direct_memory_access_len();
-        let ptr = unsafe { mem.direct_memory_access_ptr() } as *const c_void;
+        let regions = unsafe { mem.direct_memory_access_regions() };
 
-        if let Some(mapped) = self.mapped_memory {
-            assert_eq!(mapped.base, base, "guest memory base changed");
-            assert_eq!(mapped.len, len, "guest memory length changed");
-            assert_eq!(mapped.ptr, ptr, "guest memory backing pointer changed");
+        if !self.mapped_memory.is_empty() {
+            assert_eq!(
+                self.mapped_memory.len(),
+                regions.len(),
+                "guest memory region count changed"
+            );
+            for (mapped, (base, len, ptr)) in self.mapped_memory.iter().zip(regions) {
+                assert_eq!(mapped.base, base, "guest memory base changed");
+                assert_eq!(mapped.len, len, "guest memory length changed");
+                assert_eq!(
+                    mapped.ptr,
+                    ptr.cast_const(),
+                    "guest memory backing pointer changed"
+                );
+            }
             return;
         }
 
-        assert!(base.is_multiple_of(0x1000));
-        assert!(len.is_multiple_of(0x1000));
+        for (base, len, ptr) in regions {
+            assert!(base.is_multiple_of(0x1000));
+            assert!(len.is_multiple_of(0x1000));
 
-        unsafe {
-            self.uc
-                .mem_map_ptr(base as u64, len as u64, Prot::ALL, ptr.cast_mut())
-                .expect("failed to map guest memory into Unicorn");
+            unsafe {
+                self.uc
+                    .mem_map_ptr(base as u64, len as u64, Prot::ALL, ptr)
+                    .expect("failed to map guest memory into Unicorn");
+            }
+
+            self.mapped_memory.push(MappedMemory {
+                base,
+                len,
+                ptr: ptr.cast_const(),
+            });
         }
 
-        if mem.null_segment_size() > 0 && base == 0 {
+        if mem.null_segment_size() > 0
+            && self
+                .mapped_memory
+                .iter()
+                .any(|region| region.base == 0 && region.len >= mem.null_segment_size())
+        {
             self.uc
                 .mem_protect(0, mem.null_segment_size() as u64, Prot::NONE)
                 .expect("failed to protect null page in Unicorn");
         }
-
-        self.mapped_memory = Some(MappedMemory { base, len, ptr });
     }
 
     fn sync_regs_to_unicorn(&mut self) {
@@ -489,7 +509,9 @@ impl CpuBackend for UnicornCpu {
     }
 
     fn invalidate_cache_range(&mut self, base: u32, size: GuestUSize) {
-        let end = base.checked_add(size).expect("cache invalidation range overflow");
+        let end = base
+            .checked_add(size)
+            .expect("cache invalidation range overflow");
         self.uc
             .ctl_remove_cache(base as u64, end as u64)
             .expect("failed to invalidate Unicorn translation cache");
@@ -563,14 +585,20 @@ fn install_exception_hooks(
             .map(CpuState::Svc)
             .unwrap_or(CpuState::Error(CpuError::Breakpoint));
         svc_state.set(Some(state));
-        uc.emu_stop().expect("failed to stop Unicorn after interrupt");
+        uc.emu_stop()
+            .expect("failed to stop Unicorn after interrupt");
     })?;
 
     let mem_state = pending_state.clone();
-    uc.add_mem_hook(HookType::MEM_INVALID, 1, 0, move |_uc, _ty, _addr, _size, _value| {
-        mem_state.set(Some(CpuState::Error(CpuError::MemoryError)));
-        false
-    })?;
+    uc.add_mem_hook(
+        HookType::MEM_INVALID,
+        1,
+        0,
+        move |_uc, _ty, _addr, _size, _value| {
+            mem_state.set(Some(CpuState::Error(CpuError::MemoryError)));
+            false
+        },
+    )?;
 
     let invalid_state = pending_state;
     uc.add_insn_invalid_hook(move |uc| {

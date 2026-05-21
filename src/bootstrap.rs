@@ -1,14 +1,13 @@
 pub(crate) mod bridge;
 
+use crate::environment::Environment;
 use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MemRegion, MutPtr, MutVoidPtr, Ptr};
-use crate::syscall::Syscall;
 use crate::unicorn;
 use crate::{compat, file};
 use libc::{c_char, c_int, c_void};
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::ffi::CStr;
 use std::ptr;
-use std::ptr::NonNull;
 use unicorn_engine::RegisterARM;
 
 const MR_SUCCESS: c_int = 0;
@@ -27,7 +26,7 @@ const TOTAL_MEMORY: u32 = END_ADDRESS - START_ADDRESS;
 static mut MRP_MEM: *mut u8 = ptr::null_mut();
 static mut LOW_MEM: *mut u8 = ptr::null_mut();
 thread_local! {
-    static GUEST_MEM: RefCell<Option<Mem>> = const { RefCell::new(None) };
+    static GUEST_MEM: Cell<*mut Mem> = const { Cell::new(ptr::null_mut()) };
 }
 
 pub struct Bootstrap {
@@ -35,8 +34,11 @@ pub struct Bootstrap {
 }
 
 impl Bootstrap {
-    pub fn start(syscall: &mut Syscall) -> Result<Self, c_int> {
-        let uc = init_bootstrap(syscall);
+    pub fn start(env: &mut Environment) -> Result<Self, c_int> {
+        env.mem = crate::environment::nullable_box::NullableBox::new(new_bootstrap_mem());
+        env.syscall.initialize_process(&mut env.mem);
+
+        let uc = init_bootstrap(env);
         if uc.is_null() {
             log!("init_bootstrap() fail.");
             return Err(MR_FAILED);
@@ -83,54 +85,25 @@ impl Drop for Bootstrap {
     }
 }
 
-fn set_guest_mem(mem: Option<Mem>) {
+fn set_guest_mem(mem: *mut Mem) {
     GUEST_MEM.with(|guest_mem| {
-        *guest_mem.borrow_mut() = mem;
+        guest_mem.set(mem);
     });
-}
-
-unsafe fn rebuild_guest_mem() -> Result<(), ()> {
-    if MRP_MEM.is_null() {
-        return Err(());
-    }
-
-    let mut regions = Vec::new();
-    if !LOW_MEM.is_null() {
-        regions.push(MemRegion::new_borrowed(
-            0,
-            NonNull::new(LOW_MEM).unwrap(),
-            CODE_ADDRESS,
-        ));
-    }
-    regions.push(MemRegion::new_borrowed(
-        START_ADDRESS,
-        NonNull::new(MRP_MEM).unwrap(),
-        TOTAL_MEMORY,
-    ));
-
-    set_guest_mem(Some(Mem::from_regions_with_allocator_range_and_alignment(
-        regions,
-        MEMORY_MANAGER_ADDRESS,
-        MEMORY_MANAGER_SIZE,
-        8,
-        8,
-    )));
-    Ok(())
 }
 
 pub fn with_guest_mem<R>(f: impl FnOnce(&Mem) -> R) -> R {
     GUEST_MEM.with(|guest_mem| {
-        let guest_mem = guest_mem.borrow();
-        let mem = guest_mem.as_ref().expect("guest memory is not initialized");
-        f(mem)
+        let mem = guest_mem.get();
+        assert!(!mem.is_null(), "guest memory is not initialized");
+        f(unsafe { &*mem })
     })
 }
 
 pub fn with_guest_mem_mut<R>(f: impl FnOnce(&mut Mem) -> R) -> R {
     GUEST_MEM.with(|guest_mem| {
-        let mut guest_mem = guest_mem.borrow_mut();
-        let mem = guest_mem.as_mut().expect("guest memory is not initialized");
-        f(mem)
+        let mem = guest_mem.get();
+        assert!(!mem.is_null(), "guest memory is not initialized");
+        f(unsafe { &mut *mem })
     })
 }
 
@@ -163,12 +136,13 @@ pub fn guest_host_ptr_mut(addr: u32, count: GuestUSize) -> *mut c_void {
 
 pub fn get_mrp_mem_ptr(addr: u32) -> *mut c_void {
     GUEST_MEM.with(|guest_mem| {
-        let mut guest_mem = guest_mem.borrow_mut();
-        let Some(mem) = guest_mem.as_mut() else {
+        let mem = guest_mem.get();
+        if mem.is_null() {
             return ptr::null_mut();
-        };
+        }
         let ptr = MutPtr::<u8>::from_bits(addr);
-        mem.get_bytes_fallible_mut(ptr.cast_const().cast_void(), 1)
+        unsafe { &mut *mem }
+            .get_bytes_fallible_mut(ptr.cast_const().cast_void(), 1)
             .map_or(ptr::null_mut(), |bytes| bytes.as_mut_ptr().cast())
     })
 }
@@ -178,29 +152,38 @@ pub fn to_mrp_mem_addr(ptr: *mut c_void) -> u32 {
         return 0;
     }
     GUEST_MEM.with(|guest_mem| {
-        let guest_mem = guest_mem.borrow();
-        let mem = guest_mem.as_ref().expect("guest memory is not initialized");
-        mem.host_ptr_to_guest_ptr(ptr.cast_const()).to_bits()
+        let mem = guest_mem.get();
+        assert!(!mem.is_null(), "guest memory is not initialized");
+        unsafe { &*mem }
+            .host_ptr_to_guest_ptr(ptr.cast_const())
+            .to_bits()
     })
 }
 
 pub fn free_bootstrap(uc: *mut c_void) -> c_int {
     unsafe {
-        set_guest_mem(None);
-        if !MRP_MEM.is_null() {
-            libc::free(MRP_MEM as *mut c_void);
-            MRP_MEM = ptr::null_mut();
-        }
-        if !LOW_MEM.is_null() {
-            libc::free(LOW_MEM as *mut c_void);
-            LOW_MEM = ptr::null_mut();
-        }
+        set_guest_mem(ptr::null_mut());
+        MRP_MEM = ptr::null_mut();
+        LOW_MEM = ptr::null_mut();
         unicorn::clear_owner(uc);
     }
     0
 }
 
-pub fn init_bootstrap(syscall: &mut Syscall) -> *mut c_void {
+pub(crate) fn new_bootstrap_mem() -> Mem {
+    Mem::from_regions_with_allocator_range_and_alignment(
+        vec![
+            MemRegion::new_owned(0, CODE_ADDRESS),
+            MemRegion::new_owned(START_ADDRESS, TOTAL_MEMORY),
+        ],
+        MEMORY_MANAGER_ADDRESS,
+        MEMORY_MANAGER_SIZE,
+        8,
+        8,
+    )
+}
+
+pub fn init_bootstrap(env: &mut Environment) -> *mut c_void {
     let mut engine = match unicorn::new_arm() {
         Ok(engine) => engine,
         Err(err) => {
@@ -213,31 +196,35 @@ pub fn init_bootstrap(syscall: &mut Syscall) -> *mut c_void {
     };
     let uc = engine.get_handle().cast::<c_void>();
 
-    let map_result = (|| {
-        let mrp_mem = unsafe { libc::malloc(TOTAL_MEMORY as usize) as *mut u8 };
-        unsafe {
-            MRP_MEM = mrp_mem;
-        }
-        if mrp_mem.is_null() {
-            log!("Failed malloc mrp memory");
-            return Err(());
-        }
-
-        unsafe {
-            engine.mem_map_ptr(
-                START_ADDRESS as u64,
-                TOTAL_MEMORY as u64,
-                unicorn_engine::unicorn_const::Prot::ALL,
-                mrp_mem as *mut c_void,
-            )
-        }
+    let map_result: Result<(), ()> = (|| {
+        for (base, len, ptr) in unsafe { env.mem.direct_memory_access_regions() } {
+            unsafe {
+                engine.mem_map_ptr(
+                    base as u64,
+                    len as u64,
+                    unicorn_engine::unicorn_const::Prot::ALL,
+                    ptr,
+                )
+            }
             .map_err(|err| {
-                log!("Failed mem map: {err:?} ({})", unicorn::error_text(err));
+                log!(
+                    "Failed mem map region 0x{base:X}..0x{:X}: {err:?} ({})",
+                    base + len,
+                    unicorn::error_text(err)
+                );
             })?;
 
-        unsafe { rebuild_guest_mem() }.map_err(|_| {
-            log!("Failed init guest memory map");
-        })?;
+            match base {
+                0 => unsafe {
+                    LOW_MEM = ptr.cast::<u8>();
+                },
+                START_ADDRESS => unsafe {
+                    MRP_MEM = ptr.cast::<u8>();
+                },
+                _ => {}
+            }
+        }
+        set_guest_mem((&mut *env.mem) as *mut Mem);
 
         compat::init_memory_manager(MEMORY_MANAGER_ADDRESS, MEMORY_MANAGER_SIZE);
         Ok(())
@@ -251,31 +238,10 @@ pub fn init_bootstrap(syscall: &mut Syscall) -> *mut c_void {
     let uc = unicorn::store_owner(engine);
 
     let init_result = (|| {
-        if bridge::bridge_init(uc, syscall) != MR_SUCCESS {
+        if bridge::bridge_init(uc, &mut env.syscall) != MR_SUCCESS {
             log!("Failed bridge_init()");
             return Err(());
         }
-
-        let low_mem = unsafe { libc::malloc(CODE_ADDRESS as usize) as *mut u8 };
-        unsafe {
-            LOW_MEM = low_mem;
-        }
-        if low_mem.is_null() {
-            log!("Failed malloc low memory");
-            return Err(());
-        }
-        unsafe {
-            ptr::write_bytes(low_mem, 0, CODE_ADDRESS as usize);
-        }
-        unicorn::mem_map_ptr(uc, 0, CODE_ADDRESS as u64, low_mem as *mut c_void).map_err(
-            |err| {
-                log!("Failed low mem map: {err:?} ({})", unicorn::error_text(err));
-            },
-        )?;
-
-        unsafe { rebuild_guest_mem() }.map_err(|_| {
-            log!("Failed update guest memory map");
-        })?;
 
         unicorn::add_mem_invalid_hook(uc, |uc, type_, address, size, value| {
             let type_name = unicorn::mem_type_name(type_);
