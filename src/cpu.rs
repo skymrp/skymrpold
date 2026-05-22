@@ -62,17 +62,59 @@ pub trait CpuBackend {
     fn cpsr(&self) -> u32;
     fn set_cpsr(&mut self, cpsr: u32);
 
+    fn reg(&self, reg: usize) -> u32 {
+        self.regs()[reg]
+    }
+
+    fn set_reg(&mut self, reg: usize, value: u32) {
+        self.regs_mut()[reg] = value;
+    }
+
+    fn pc(&self) -> u32 {
+        self.reg(Cpu::PC)
+    }
+
+    fn set_pc(&mut self, value: u32) {
+        self.set_reg(Cpu::PC, value);
+    }
+
+    fn lr(&self) -> u32 {
+        self.reg(Cpu::LR)
+    }
+
+    fn set_lr(&mut self, value: u32) {
+        self.set_reg(Cpu::LR, value);
+    }
+
+    fn sp(&self) -> u32 {
+        self.reg(Cpu::SP)
+    }
+
+    fn set_sp(&mut self, value: u32) {
+        self.set_reg(Cpu::SP, value);
+    }
+
+    fn is_thumb(&self) -> bool {
+        (self.cpsr() & Cpu::CPSR_THUMB) != 0
+    }
+
+    fn current_instruction_len(&self) -> u32 {
+        if self.is_thumb() {
+            2
+        } else {
+            4
+        }
+    }
+
     /// Get PC with the Thumb bit appropriately set.
     fn pc_with_thumb_bit(&self) -> GuestFunction {
-        let pc = self.regs()[Cpu::PC];
-        let thumb = (self.cpsr() & Cpu::CPSR_THUMB) == Cpu::CPSR_THUMB;
-        GuestFunction::from_addr_and_thumb_flag(pc, thumb)
+        GuestFunction::from_addr_and_thumb_flag(self.pc(), self.is_thumb())
     }
 
     /// Set PC and the Thumb flag for executing a guest function. Note that this
     /// does not touch LR.
     fn branch(&mut self, new_pc: GuestFunction) {
-        self.regs_mut()[Cpu::PC] = new_pc.addr_without_thumb_bit();
+        self.set_pc(new_pc.addr_without_thumb_bit());
         let cpsr_without_thumb = self.cpsr() & (!Cpu::CPSR_THUMB);
         self.set_cpsr(cpsr_without_thumb | ((new_pc.is_thumb() as u32) * Cpu::CPSR_THUMB));
     }
@@ -85,10 +127,22 @@ pub trait CpuBackend {
         new_lr: GuestFunction,
     ) -> (GuestFunction, GuestFunction) {
         let old_pc = self.pc_with_thumb_bit();
-        let old_lr = GuestFunction::from_addr_with_thumb_bit(self.regs()[Cpu::LR]);
+        let old_lr = GuestFunction::from_addr_with_thumb_bit(self.lr());
         self.branch(new_pc);
-        self.regs_mut()[Cpu::LR] = new_lr.addr_with_thumb_bit();
+        self.set_lr(new_lr.addr_with_thumb_bit());
         (old_pc, old_lr)
+    }
+
+    /// Rewind PC from the instruction after the current exception back to the
+    /// faulting instruction.
+    fn rewind_pc_to_current_instruction(&mut self) {
+        self.set_pc(self.pc() - self.current_instruction_len());
+    }
+
+    /// Address of an SVC instruction after the backend has stopped at the
+    /// following instruction.
+    fn current_svc_pc(&self) -> u32 {
+        self.pc() - self.current_instruction_len()
     }
 
     /// Dump the registers of the current CPU to the log output.

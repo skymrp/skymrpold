@@ -117,12 +117,7 @@ impl Environment {
             // occurred, rather than the next instruction. This is necessary for
             // GDB to detect its software breakpoints. For some reason this
             // isn't correct for memory errors however.
-            let instruction_len = if (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0 {
-                2
-            } else {
-                4
-            };
-            self.cpu.regs_mut()[cpu::Cpu::PC] -= instruction_len;
+            self.cpu.rewind_pc_to_current_instruction();
         }
 
         if self.gdb_server.is_none() {
@@ -200,7 +195,7 @@ impl Environment {
                 // The program counter is pointing at the
                 // instruction after the SVC, but we want the
                 // address of the SVC itself.
-                let svc_pc = self.cpu.regs()[cpu::Cpu::PC] - 4;
+                let svc_pc = self.cpu.current_svc_pc();
                 match svc {
                     syscall::Syscall::SVC_RETURN_TO_HOST => {
                         assert!(
@@ -220,7 +215,7 @@ impl Environment {
                         if let Some(function) = self.syscall.get_svc_handler(svc_pc, svc) {
                             function.call_from_guest(self);
                         } else {
-                            self.cpu.regs_mut()[cpu::Cpu::PC] = svc_pc;
+                            self.cpu.set_pc(svc_pc);
                         }
                         NextAction::Continue
                     }

@@ -214,7 +214,7 @@ pub fn init_bootstrap(env: &mut Environment) -> c_int {
         }
 
         let sp = STACK_ADDRESS + STACK_SIZE;
-        env.cpu.regs_mut()[crate::cpu::Cpu::SP] = sp;
+        env.cpu.set_sp(sp);
 
         Ok(())
     })();

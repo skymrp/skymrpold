@@ -56,10 +56,6 @@ impl Unicorn {
         cpu
     }
 
-    fn is_thumb(&self) -> bool {
-        (self.context.cpsr & Cpu::CPSR_THUMB) != 0
-    }
-
     fn ensure_memory_mapped(&mut self, mem: &mut Mem) {
         let regions = unsafe { mem.direct_memory_access_regions() };
 
