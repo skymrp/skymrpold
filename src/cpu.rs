@@ -446,14 +446,14 @@ impl UnicornCpu {
     }
 
     fn sync_regs_to_unicorn(&mut self) {
+        self.uc
+            .reg_write(RegisterARM::CPSR, self.cpsr as u64)
+            .expect("failed to write Unicorn CPSR");
         for (idx, reg) in ARM_REGS.iter().enumerate() {
             self.uc
                 .reg_write(*reg, self.regs[idx] as u64)
                 .expect("failed to write Unicorn register");
         }
-        self.uc
-            .reg_write(RegisterARM::CPSR, self.cpsr as u64)
-            .expect("failed to write Unicorn CPSR");
     }
 
     fn sync_regs_from_unicorn(&mut self) {

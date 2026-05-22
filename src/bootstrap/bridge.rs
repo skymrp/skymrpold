@@ -1,14 +1,16 @@
-use crate::abi::{self, AbiReg, GuestArg, GuestRet, RegisterContext, StackMemoryContext};
+use crate::abi::{
+    self, AbiReg, CallFromGuest, CallFromHost, GuestArg, GuestFunction, GuestRet, RegisterContext,
+    StackMemoryContext,
+};
 use crate::bootstrap;
+use crate::cpu::Cpu;
+use crate::environment::Environment;
 use crate::mem::{ConstPtr, GuestUSize, MutPtr, Ptr, SafeWrite};
-use crate::syscall::Syscall;
-use crate::unicorn;
 use crate::{compat, file, network, window};
 use libc::{c_char, c_int, c_ushort, c_void};
 use std::ffi::CStr;
 use std::ptr;
 use std::sync::Mutex;
-use unicorn_engine::RegisterARM;
 
 const MR_SUCCESS: c_int = 0;
 const MR_FAILED: c_int = -1;
@@ -34,7 +36,7 @@ enum BridgeMapType {
 }
 
 type BridgeHandler = &'static dyn BridgeCallFromGuest;
-type BridgeInit = fn(&BridgeEntry, *mut c_void, u32);
+type BridgeInit = fn(&BridgeEntry, &mut Environment, u32);
 
 #[derive(Clone, Copy)]
 struct BridgeEntry {
@@ -43,6 +45,26 @@ struct BridgeEntry {
     name: &'static str,
     init: Option<BridgeInit>,
     handler: Option<BridgeHandler>,
+}
+
+impl CallFromGuest for BridgeEntry {
+    fn call_from_guest(&self, env: &mut Environment) {
+        let Some(handler) = self.handler else {
+            log!("!!! {}() Not yet implemented function !!!", self.name);
+            std::process::exit(1);
+        };
+
+        log!("[SVC] -> {} pos=0x{:X} type=func", self.name, self.pos);
+        let mut ctx = BridgeContext::new(env);
+        handler.call_from_guest(self, &mut ctx);
+        let ret = ctx.arg::<u32>(0);
+        let pc = ctx.read_reg(AbiReg::PC);
+        let lr = ctx.read_reg(AbiReg::LR);
+        log!(
+            "[SVC] <- {} ret=0x{ret:08X} pc=0x{pc:08X} lr=0x{lr:08X}",
+            self.name
+        );
+    }
 }
 
 #[repr(C)]
@@ -181,16 +203,24 @@ macro_rules! entry {
 }
 
 struct BridgeContext {
-    uc: *mut c_void,
+    env: *mut Environment,
 }
 
 impl BridgeContext {
-    fn new(uc: *mut c_void) -> Self {
-        Self { uc }
+    fn new(env: &mut Environment) -> Self {
+        Self { env }
     }
 
     fn uc(&self) -> *mut c_void {
-        self.uc
+        self.env.cast::<c_void>()
+    }
+
+    fn env(&self) -> &Environment {
+        unsafe { &*self.env }
+    }
+
+    fn env_mut(&mut self) -> &mut Environment {
+        unsafe { &mut *self.env }
     }
 
     fn arg<T: GuestArg>(&mut self, n: usize) -> T {
@@ -259,26 +289,23 @@ impl BridgeContext {
     }
 
     fn mem_read_u32(&self, addr: u32) -> u32 {
-        unicorn::mem_read_u32(self.uc, addr as u64).unwrap_or(0)
+        self.env().mem.read(Ptr::<u32, false>::from_bits(addr))
     }
 
     fn mem_write_u32(&self, addr: u32, value: u32) {
-        unicorn::mem_write_u32(self.uc, addr as u64, value).ok();
+        unsafe { &mut *self.env }
+            .mem
+            .write(MutPtr::<u32>::from_bits(addr), value);
     }
 }
 
 impl RegisterContext for BridgeContext {
     fn read_reg(&mut self, reg: AbiReg) -> u32 {
-        unicorn::reg_read(self.uc, abi_reg_to_unicorn(reg)).unwrap_or(0)
+        self.env_mut().cpu.regs()[abi_reg_index(reg)]
     }
 
     fn write_reg(&mut self, reg: AbiReg, value: u32) {
-        if let Err(err) = unicorn::reg_write(self.uc, abi_reg_to_unicorn(reg), value) {
-            log!(
-                "Failed write register {reg:?}: {err:?} ({})",
-                unicorn::error_text(err)
-            );
-        }
+        self.env_mut().cpu.regs_mut()[abi_reg_index(reg)] = value;
     }
 }
 
@@ -292,66 +319,33 @@ impl StackMemoryContext for BridgeContext {
     }
 }
 
-fn abi_reg_to_unicorn(reg: AbiReg) -> RegisterARM {
+fn abi_reg_index(reg: AbiReg) -> usize {
     match reg {
-        AbiReg::R0 => RegisterARM::R0,
-        AbiReg::R1 => RegisterARM::R1,
-        AbiReg::R2 => RegisterARM::R2,
-        AbiReg::R3 => RegisterARM::R3,
-        AbiReg::R4 => RegisterARM::R4,
-        AbiReg::R5 => RegisterARM::R5,
-        AbiReg::R6 => RegisterARM::R6,
-        AbiReg::R7 => RegisterARM::R7,
-        AbiReg::R8 => RegisterARM::R8,
-        AbiReg::R9 => RegisterARM::R9,
-        AbiReg::R10 => RegisterARM::R10,
-        AbiReg::R11 => RegisterARM::R11,
-        AbiReg::R12 => RegisterARM::R12,
-        AbiReg::SP => RegisterARM::SP,
-        AbiReg::LR => RegisterARM::LR,
-        AbiReg::PC => RegisterARM::PC,
+        AbiReg::R0 => 0,
+        AbiReg::R1 => 1,
+        AbiReg::R2 => 2,
+        AbiReg::R3 => 3,
+        AbiReg::R4 => 4,
+        AbiReg::R5 => 5,
+        AbiReg::R6 => 6,
+        AbiReg::R7 => 7,
+        AbiReg::R8 => 8,
+        AbiReg::R9 => 9,
+        AbiReg::R10 => 10,
+        AbiReg::R11 => 11,
+        AbiReg::R12 => 12,
+        AbiReg::SP => Cpu::SP,
+        AbiReg::LR => Cpu::LR,
+        AbiReg::PC => Cpu::PC,
     }
 }
 
-fn run_code(ctx: &mut BridgeContext, mut start_addr: u32, stop_addr: u32, is_thumb: bool) {
-    ctx.write_reg(AbiReg::LR, stop_addr);
-    if is_thumb {
-        start_addr |= 1;
-    }
-    if let Err(err) = unicorn::emu_start(ctx.uc(), start_addr as u64, stop_addr as u64, 0, 0) {
-        log!(
-            "Failed on uc_emu_start() with error returned: {err:?} ({})",
-            unicorn::error_text(err)
-        );
-        std::process::exit(1);
-    }
+fn run_code(env: &mut Environment, start_addr: u32, is_thumb: bool) {
+    let function = GuestFunction::from_addr_and_thumb_flag(start_addr, is_thumb);
+    let _: u32 = function.call_from_host(env, ());
 }
 
-fn dispatch_bridge_svc(uc: *mut c_void, svc: u32, entry: usize) {
-    let entry = unsafe { *(entry as *const BridgeEntry) };
-    let Some(handler) = entry.handler else {
-        log!("!!! {}() Not yet implemented function !!!", entry.name);
-        std::process::exit(1);
-    };
-
-    log!("[SVC] -> {} pos=0x{:X} type=func", entry.name, entry.pos);
-    let mut ctx = BridgeContext::new(uc);
-    handler.call_from_guest(&entry, &mut ctx);
-    let ret = ctx.arg::<u32>(0);
-    let pc = ctx.read_reg(AbiReg::PC);
-    let lr = ctx.read_reg(AbiReg::LR);
-    log!(
-        "[SVC] <- {} ret=0x{ret:08X} pc=0x{pc:08X} lr=0x{lr:08X}",
-        entry.name
-    );
-}
-
-fn hooks_init(
-    uc: *mut c_void,
-    syscall: &mut Syscall,
-    map: &'static [BridgeEntry],
-    table_size: u32,
-) -> *mut c_void {
+fn hooks_init(env: &mut Environment, map: &'static [BridgeEntry], table_size: u32) -> *mut c_void {
     let func_count = map
         .iter()
         .filter(|obj| obj.type_ == BridgeMapType::Func)
@@ -365,21 +359,22 @@ fn hooks_init(
         match obj.type_ {
             BridgeMapType::Data => {
                 if let Some(init) = obj.init {
-                    init(obj, uc, addr);
+                    init(obj, env, addr);
                 }
             }
             BridgeMapType::Func => {
                 if let Some(init) = obj.init {
-                    init(obj, uc, addr);
+                    init(obj, env, addr);
                 }
-                let svc = syscall.link_host_function(
-                    uc,
+                let svc = env.syscall.link_typed_host_function(
+                    &mut env.mem,
                     stub_address,
                     obj.name,
-                    dispatch_bridge_svc,
-                    obj as *const BridgeEntry as usize,
+                    obj as &'static dyn CallFromGuest,
                 );
-                unicorn::mem_write_u32(uc, addr as u64, stub_address).ok();
+                bootstrap::with_guest_mem_mut(|mem| {
+                    mem.write(MutPtr::<u32>::from_bits(addr), stub_address);
+                });
                 log!("[SVC] linked {} pos=0x{:X} svc=#{svc}", obj.name, obj.pos);
                 stub_address += 8;
             }
@@ -390,7 +385,6 @@ fn hooks_init(
 
 fn br_mr_c_function_new(ctx: &mut BridgeContext, p_f: u32, p_len: u32) -> u32 {
     log!("ext call _mr_c_function_new(0x{p_f:X}[{p_f}], 0x{p_len:X}[{p_len}])");
-    compat::dump_reg(ctx.uc());
 
     let mr_c_function_p = compat::malloc_ext(p_len) as *mut MrCFunctionP;
     unsafe {
@@ -482,11 +476,11 @@ fn br_mr_rmdir(ctx: &mut BridgeContext, name: ConstPtr<u8>) -> u32 {
     ctx.with_cstr(name, file::rmdir_cstr) as u32
 }
 
-fn br_get_uptime_ms_init(_o: &BridgeEntry, uc: *mut c_void, addr: u32) {
+fn br_get_uptime_ms_init(_o: &BridgeEntry, env: &mut Environment, addr: u32) {
     unsafe {
         UPTIME_MS = compat::get_uptime_ms() as u64;
     }
-    unicorn::mem_write_u32(uc, addr as u64, addr).ok();
+    env.mem.write(MutPtr::<u32>::from_bits(addr), addr);
 }
 
 fn br_get_uptime_ms(_ctx: &mut BridgeContext) -> u32 {
@@ -559,7 +553,7 @@ fn br_opendir(ctx: &mut BridgeContext, name: ConstPtr<u8>) -> u32 {
     ctx.with_cstr(name, file::opendir_cstr) as u32
 }
 
-fn br_readdir_init(_o: &BridgeEntry, uc: *mut c_void, addr: u32) {
+fn br_readdir_init(_o: &BridgeEntry, env: &mut Environment, addr: u32) {
     let shared_mem = compat::malloc_ext_guest(READDIR_SHARED_MEM_SIZE as u32).to_bits();
     unsafe {
         READDIR_SHARED_MEM = shared_mem;
@@ -571,7 +565,7 @@ fn br_readdir_init(_o: &BridgeEntry, uc: *mut c_void, addr: u32) {
         )
         .fill(0);
     });
-    unicorn::mem_write_u32(uc, addr as u64, addr).ok();
+    env.mem.write(MutPtr::<u32>::from_bits(addr), addr);
 }
 
 fn br_readdir(_ctx: &mut BridgeContext, f: u32) -> u32 {
@@ -966,18 +960,17 @@ static DSM_REQUIRE_FUNCS_MAP: &[BridgeEntry] = &[
     entry!(0xC8, func, "mr_editGetText", typed br_mr_edit_get_text as fn(&mut BridgeContext, u32) -> u32),
 ];
 
-pub fn bridge_init(uc: *mut c_void, syscall: &mut Syscall) -> c_int {
-    syscall.ensure_unicorn_svc_hook(uc);
-
+pub fn bridge_init(env: &mut Environment) -> c_int {
     let len = 4 * MR_TABLE_FUNC_MAP.len() as u32;
     unsafe {
-        MR_TABLE = hooks_init(uc, syscall, MR_TABLE_FUNC_MAP, len);
+        MR_TABLE = hooks_init(env, MR_TABLE_FUNC_MAP, len);
 
-        DSM_REQUIRE_FUNCS = hooks_init(uc, syscall, DSM_REQUIRE_FUNCS_MAP, DSM_REQUIRE_FUNCS_SIZE);
+        DSM_REQUIRE_FUNCS = hooks_init(env, DSM_REQUIRE_FUNCS_MAP, DSM_REQUIRE_FUNCS_SIZE);
     }
     let dsm_require_funcs = unsafe { DSM_REQUIRE_FUNCS };
     let flags_addr = bootstrap::to_mrp_mem_addr(dsm_require_funcs) + 0xcc;
-    unicorn::mem_write_u32(uc, flags_addr as u64, FLAG_USE_UTF8_EDIT).ok();
+    env.mem
+        .write(MutPtr::<u32>::from_bits(flags_addr), FLAG_USE_UTF8_EDIT);
 
     unsafe {
         MR_C_EVENT = compat::malloc_ext(std::mem::size_of::<Event>() as u32) as *mut Event;
@@ -987,15 +980,15 @@ pub fn bridge_init(uc: *mut c_void, syscall: &mut Syscall) -> c_int {
     MR_SUCCESS
 }
 
-pub fn bridge_ext_init(uc: *mut c_void) -> c_int {
-    let mut ctx = BridgeContext::new(uc);
+pub fn bridge_ext_init(env: &mut Environment) -> c_int {
+    let mut ctx = BridgeContext::new(env);
     let mr_table = unsafe { MR_TABLE };
     let mut v = bootstrap::to_mrp_mem_addr(mr_table);
     ctx.mem_write_u32(CODE_ADDRESS, v);
 
     v = 1;
     ctx.write_reg(AbiReg::R0, v);
-    run_code(&mut ctx, CODE_ADDRESS + 8, CODE_ADDRESS, false);
+    run_code(ctx.env_mut(), CODE_ADDRESS + 8, false);
 
     let mr_c_function_p = unsafe { MR_C_FUNCTION_P };
     if !mr_c_function_p.is_null() {
@@ -1006,8 +999,8 @@ pub fn bridge_ext_init(uc: *mut c_void) -> c_int {
     MR_SUCCESS
 }
 
-fn bridge_mr_ext_helper(uc: *mut c_void, code: u32, input: u32, input_len: u32) -> c_int {
-    let mut ctx = BridgeContext::new(uc);
+fn bridge_mr_ext_helper(env: &mut Environment, code: u32, input: u32, input_len: u32) -> c_int {
+    let mut ctx = BridgeContext::new(env);
     let mr_c_function_p = unsafe { MR_C_FUNCTION_P };
     let p = bootstrap::to_mrp_mem_addr(mr_c_function_p as *mut c_void);
     ctx.write_reg(AbiReg::R0, p);
@@ -1016,11 +1009,11 @@ fn bridge_mr_ext_helper(uc: *mut c_void, code: u32, input: u32, input_len: u32) 
     ctx.write_reg(AbiReg::R3, input_len);
 
     let helper_addr = unsafe { MR_EXT_HELPER_ADDR };
-    run_code(&mut ctx, helper_addr, CODE_ADDRESS, false);
+    run_code(ctx.env_mut(), helper_addr, false);
     ctx.arg::<u32>(0) as c_int
 }
 
-fn bridge_mr_event(uc: *mut c_void, code: c_int, param0: c_int, param1: c_int) -> c_int {
+fn bridge_mr_event(env: &mut Environment, code: c_int, param0: c_int, param1: c_int) -> c_int {
     let mr_c_event = unsafe { MR_C_EVENT };
     unsafe {
         (*mr_c_event).code = code;
@@ -1028,16 +1021,17 @@ fn bridge_mr_event(uc: *mut c_void, code: c_int, param0: c_int, param1: c_int) -
         (*mr_c_event).p1 = param1;
     }
     bridge_mr_ext_helper(
-        uc,
+        env,
         1,
         bootstrap::to_mrp_mem_addr(mr_c_event as *mut c_void),
         std::mem::size_of::<Event>() as u32,
     )
 }
 
-pub fn bridge_dsm_network_cb(uc: *mut c_void, addr: u32, p0: c_int, p1: u32) -> c_int {
+pub fn bridge_dsm_network_cb(env: *mut c_void, addr: u32, p0: c_int, p1: u32) -> c_int {
     let _guard = BRIDGE_LOCK.lock().unwrap();
-    let mut ctx = BridgeContext::new(uc);
+    let env = unsafe { &mut *env.cast::<Environment>() };
+    let mut ctx = BridgeContext::new(env);
     let r9 = ctx.read_reg(AbiReg::R9);
 
     let mr_c_function_p = unsafe { MR_C_FUNCTION_P };
@@ -1046,14 +1040,14 @@ pub fn bridge_dsm_network_cb(uc: *mut c_void, addr: u32, p0: c_int, p1: u32) -> 
     }
     ctx.write_reg(AbiReg::R0, p0 as u32);
     ctx.write_reg(AbiReg::R1, p1);
-    run_code(&mut ctx, addr, CODE_ADDRESS, false);
+    run_code(ctx.env_mut(), addr, false);
 
     ctx.write_reg(AbiReg::R9, r9);
     ctx.arg::<u32>(0) as c_int
 }
 
 pub fn bridge_dsm_mr_start_dsm(
-    uc: *mut c_void,
+    env: &mut Environment,
     filename: *mut c_char,
     ext: *mut c_char,
     entry: *mut c_char,
@@ -1072,7 +1066,7 @@ pub fn bridge_dsm_mr_start_dsm(
     }
 
     let input = bootstrap::to_mrp_mem_addr(start_param as *mut c_void) as c_int;
-    let ret = bridge_mr_event(uc, MR_START_DSM, input, 0);
+    let ret = bridge_mr_event(env, MR_START_DSM, input, 0);
 
     let (filename_addr, ext_addr, entry_addr) = unsafe {
         (
@@ -1099,22 +1093,22 @@ pub fn bridge_dsm_mr_start_dsm(
     ret
 }
 
-pub fn bridge_dsm_mr_pause_app(uc: *mut c_void) -> c_int {
+pub fn bridge_dsm_mr_pause_app(env: &mut Environment) -> c_int {
     let _guard = BRIDGE_LOCK.lock().unwrap();
-    bridge_mr_event(uc, MR_PAUSEAPP, 0, 0)
+    bridge_mr_event(env, MR_PAUSEAPP, 0, 0)
 }
 
-pub fn bridge_dsm_mr_resume_app(uc: *mut c_void) -> c_int {
+pub fn bridge_dsm_mr_resume_app(env: &mut Environment) -> c_int {
     let _guard = BRIDGE_LOCK.lock().unwrap();
-    bridge_mr_event(uc, MR_RESUMEAPP, 0, 0)
+    bridge_mr_event(env, MR_RESUMEAPP, 0, 0)
 }
 
-pub fn bridge_dsm_mr_timer(uc: *mut c_void) -> c_int {
+pub fn bridge_dsm_mr_timer(env: &mut Environment) -> c_int {
     let _guard = BRIDGE_LOCK.lock().unwrap();
-    bridge_mr_event(uc, MR_TIMER, 0, 0)
+    bridge_mr_event(env, MR_TIMER, 0, 0)
 }
 
-pub fn bridge_dsm_mr_event(uc: *mut c_void, code: c_int, p0: c_int, p1: c_int) -> c_int {
+pub fn bridge_dsm_mr_event(env: &mut Environment, code: c_int, p0: c_int, p1: c_int) -> c_int {
     let _guard = BRIDGE_LOCK.lock().unwrap();
     let dsm_event = unsafe { DSM_EVENT };
     unsafe {
@@ -1123,19 +1117,19 @@ pub fn bridge_dsm_mr_event(uc: *mut c_void, code: c_int, p0: c_int, p1: c_int) -
         (*dsm_event).p1 = p1;
     }
     bridge_mr_event(
-        uc,
+        env,
         MR_EVENT,
         bootstrap::to_mrp_mem_addr(dsm_event as *mut c_void) as c_int,
         0,
     )
 }
 
-pub fn bridge_dsm_init(uc: *mut c_void) -> c_int {
+pub fn bridge_dsm_init(env: &mut Environment) -> c_int {
     let dsm_require_funcs = unsafe { DSM_REQUIRE_FUNCS };
     let ret = {
         let _guard = BRIDGE_LOCK.lock().unwrap();
         bridge_mr_event(
-            uc,
+            env,
             DSM_INIT,
             bootstrap::to_mrp_mem_addr(dsm_require_funcs) as c_int,
             0,

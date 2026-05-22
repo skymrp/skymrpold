@@ -2,18 +2,18 @@ pub(crate) mod bridge;
 
 use crate::environment::Environment;
 use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MemRegion, MutPtr, MutVoidPtr, Ptr};
-use crate::unicorn;
 use crate::{compat, file};
 use libc::{c_char, c_int, c_void};
 use std::cell::Cell;
 use std::ffi::CStr;
 use std::ptr;
-use unicorn_engine::RegisterARM;
 
 const MR_SUCCESS: c_int = 0;
 const MR_FAILED: c_int = -1;
 
 const CODE_ADDRESS: u32 = 0x80000;
+const RETURN_TO_HOST_ADDRESS: u32 = 0x1000;
+const THREAD_EXIT_ADDRESS: u32 = RETURN_TO_HOST_ADDRESS + 8;
 const CODE_SIZE: u32 = 1024 * 1024;
 const STACK_ADDRESS: u32 = CODE_ADDRESS + CODE_SIZE;
 const STACK_SIZE: u32 = 1024 * 1024;
@@ -29,38 +29,38 @@ thread_local! {
     static GUEST_MEM: Cell<*mut Mem> = const { Cell::new(ptr::null_mut()) };
 }
 
-pub struct Bootstrap {
-    uc: *mut c_void,
-}
+pub struct Bootstrap;
 
 impl Bootstrap {
     pub fn start(env: &mut Environment) -> Result<Self, c_int> {
         env.mem = crate::environment::nullable_box::NullableBox::new(new_bootstrap_mem());
-        env.syscall.initialize_process(&mut env.mem);
+        env.syscall.initialize_process_at(
+            &mut env.mem,
+            RETURN_TO_HOST_ADDRESS,
+            THREAD_EXIT_ADDRESS,
+        );
         env.rebuild_cpu_for_current_memory();
 
-        let uc = init_bootstrap(env);
-        if uc.is_null() {
+        if init_bootstrap(env) == MR_FAILED {
             log!("init_bootstrap() fail.");
             return Err(MR_FAILED);
         }
 
-        if load_code(uc) == MR_FAILED {
+        if load_code(env) == MR_FAILED {
             log!("loadCode fail.");
-            free_bootstrap(uc);
+            free_bootstrap();
             return Err(MR_FAILED);
         }
 
-        bridge::bridge_ext_init(uc);
+        bridge::bridge_ext_init(env);
 
-        if bridge::bridge_dsm_init(uc) == MR_SUCCESS {
+        if bridge::bridge_dsm_init(env) == MR_SUCCESS {
             log!("bridge_dsm_init success");
-            compat::dump_reg(uc);
 
             let filename = b"dsm_gm.mrp\0";
             let ext_name = b"start.mr\0";
             let ret = bridge::bridge_dsm_mr_start_dsm(
-                uc,
+                env,
                 filename.as_ptr() as *mut c_char,
                 ext_name.as_ptr() as *mut c_char,
                 ptr::null_mut(),
@@ -68,21 +68,21 @@ impl Bootstrap {
             log!("bridge_dsm_mr_start_dsm('dsm_gm.mrp','start.mr',NULL): 0x{ret:X}");
         }
 
-        Ok(Self { uc })
+        Ok(Self)
     }
 
-    pub fn event(&mut self, code: c_int, p1: c_int, p2: c_int) -> c_int {
-        bridge::bridge_dsm_mr_event(self.uc, code, p1, p2)
+    pub fn event(&mut self, env: &mut Environment, code: c_int, p1: c_int, p2: c_int) -> c_int {
+        bridge::bridge_dsm_mr_event(env, code, p1, p2)
     }
 
-    pub fn timer(&mut self) -> c_int {
-        bridge::bridge_dsm_mr_timer(self.uc)
+    pub fn timer(&mut self, env: &mut Environment) -> c_int {
+        bridge::bridge_dsm_mr_timer(env)
     }
 }
 
 impl Drop for Bootstrap {
     fn drop(&mut self) {
-        free_bootstrap(self.uc);
+        free_bootstrap();
     }
 }
 
@@ -161,12 +161,11 @@ pub fn to_mrp_mem_addr(ptr: *mut c_void) -> u32 {
     })
 }
 
-pub fn free_bootstrap(uc: *mut c_void) -> c_int {
+pub fn free_bootstrap() -> c_int {
     unsafe {
         set_guest_mem(ptr::null_mut());
         MRP_MEM = ptr::null_mut();
         LOW_MEM = ptr::null_mut();
-        unicorn::clear_owner(uc);
     }
     0
 }
@@ -184,37 +183,9 @@ pub(crate) fn new_bootstrap_mem() -> Mem {
     )
 }
 
-pub fn init_bootstrap(env: &mut Environment) -> *mut c_void {
-    let mut engine = match unicorn::new_arm() {
-        Ok(engine) => engine,
-        Err(err) => {
-            log!(
-                "Failed on uc_open() with error returned: {err:?} ({})",
-                unicorn::error_text(err)
-            );
-            return ptr::null_mut();
-        }
-    };
-    let uc = engine.get_handle().cast::<c_void>();
-
+pub fn init_bootstrap(env: &mut Environment) -> c_int {
     let map_result: Result<(), ()> = (|| {
         for (base, len, ptr) in unsafe { env.mem.direct_memory_access_regions() } {
-            unsafe {
-                engine.mem_map_ptr(
-                    base as u64,
-                    len as u64,
-                    unicorn_engine::unicorn_const::Prot::ALL,
-                    ptr,
-                )
-            }
-            .map_err(|err| {
-                log!(
-                    "Failed mem map region 0x{base:X}..0x{:X}: {err:?} ({})",
-                    base + len,
-                    unicorn::error_text(err)
-                );
-            })?;
-
             match base {
                 0 => unsafe {
                     LOW_MEM = ptr.cast::<u8>();
@@ -232,50 +203,31 @@ pub fn init_bootstrap(env: &mut Environment) -> *mut c_void {
     })();
 
     if map_result.is_err() {
-        free_bootstrap(uc);
-        return ptr::null_mut();
+        free_bootstrap();
+        return MR_FAILED;
     }
 
-    let uc = unicorn::store_owner(engine);
-
     let init_result = (|| {
-        if bridge::bridge_init(uc, &mut env.syscall) != MR_SUCCESS {
+        if bridge::bridge_init(env) != MR_SUCCESS {
             log!("Failed bridge_init()");
             return Err(());
         }
 
-        unicorn::add_mem_invalid_hook(uc, |uc, type_, address, size, value| {
-            let type_name = unicorn::mem_type_name(type_);
-            log!(
-                ">>> Tracing mem_invalid mem_type:{type_name} at 0x{address:X}, size:0x{size:X}, value:0x{value:X}"
-            );
-            compat::dump_reg(uc.get_handle().cast::<c_void>());
-            false
-        })
-        .map_err(|err| {
-            log!(
-                "Failed hook mem invalid: {err:?} ({})",
-                unicorn::error_text(err)
-            );
-        })?;
-
         let sp = STACK_ADDRESS + STACK_SIZE;
-        unicorn::reg_write(uc, RegisterARM::SP, sp).map_err(|err| {
-            log!("Failed set stack: {err:?} ({})", unicorn::error_text(err));
-        })?;
+        env.cpu.regs_mut()[crate::cpu::Cpu::SP] = sp;
 
         Ok(())
     })();
 
     if init_result.is_err() {
-        free_bootstrap(uc);
-        return ptr::null_mut();
+        free_bootstrap();
+        return MR_FAILED;
     }
 
-    uc
+    MR_SUCCESS
 }
 
-pub fn load_code(uc: *mut c_void) -> c_int {
+pub fn load_code(env: &mut Environment) -> c_int {
     let filename = b"mythroad/cfunction.ext\0";
     let filename = CStr::from_bytes_with_nul(filename).expect("static filename has trailing NUL");
     let data = match file::read_file_cstr(filename) {
@@ -289,13 +241,8 @@ pub fn load_code(uc: *mut c_void) -> c_int {
         }
     };
 
-    let err = unicorn::mem_write(uc, CODE_ADDRESS as u64, &data);
-    if let Err(err) = err {
-        log!(
-            "uc_mem_write code failed: {err:?} ({})",
-            unicorn::error_text(err)
-        );
-        return MR_FAILED;
-    }
+    env.mem
+        .bytes_at_mut(MutPtr::<u8>::from_bits(CODE_ADDRESS), data.len() as u32)
+        .copy_from_slice(&data);
     MR_SUCCESS
 }

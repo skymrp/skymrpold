@@ -79,15 +79,21 @@ impl Environment {
     }
 
     pub fn event(&mut self, code: i32, p1: i32, p2: i32) -> i32 {
-        self.bootstrap
-            .as_mut()
-            .map_or(-1, |bootstrap| bootstrap.event(code, p1, p2))
+        let Some(mut bootstrap) = self.bootstrap.take() else {
+            return -1;
+        };
+        let ret = bootstrap.event(self, code, p1, p2);
+        self.bootstrap = Some(bootstrap);
+        ret
     }
 
     pub fn timer(&mut self) -> i32 {
-        self.bootstrap
-            .as_mut()
-            .map_or(-1, bootstrap::Bootstrap::timer)
+        let Some(mut bootstrap) = self.bootstrap.take() else {
+            return -1;
+        };
+        let ret = bootstrap.timer(self);
+        self.bootstrap = Some(bootstrap);
+        ret
     }
 
     /// Run the emulator until the app returns control to the host. This is for
