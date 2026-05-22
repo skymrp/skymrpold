@@ -5,7 +5,6 @@ pub mod audio;
 mod bootstrap;
 mod compat;
 mod cpu;
-mod debug;
 mod environment;
 mod file;
 mod gdb;
@@ -16,12 +15,11 @@ mod network;
 mod options;
 mod paths;
 mod syscall;
-mod unicorn;
 mod window;
 
-pub use window::run as run_app;
 use environment::Environment;
 pub use skymrp_version::*;
+pub use window::run as run_app;
 
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     let mut options = options::Options::default();

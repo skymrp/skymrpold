@@ -1,31 +1,18 @@
+use crate::bootstrap;
 use crate::file;
 use crate::mem::{MutPtr, MutVoidPtr, Ptr};
-use crate::bootstrap;
-use crate::unicorn;
 use libc::{c_char, c_int, c_uchar, c_void, size_t};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use unicorn_engine::RegisterARM;
 
 const MR_SUCCESS: c_int = 0;
 const MR_FAILED: c_int = -1;
 
 const MR_FILE_RDWR: u32 = 4;
 const MR_FILE_CREATE: u32 = 8;
-
-const UC_MEM_READ: c_int = 16;
-const UC_MEM_WRITE: c_int = 17;
-const UC_MEM_FETCH: c_int = 18;
-const UC_MEM_READ_UNMAPPED: c_int = 19;
-const UC_MEM_WRITE_UNMAPPED: c_int = 20;
-const UC_MEM_FETCH_UNMAPPED: c_int = 21;
-const UC_MEM_WRITE_PROT: c_int = 22;
-const UC_MEM_READ_PROT: c_int = 23;
-const UC_MEM_FETCH_PROT: c_int = 24;
-const UC_MEM_READ_AFTER: c_int = 25;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -127,7 +114,8 @@ fn alloc_guest(len: u32) -> Option<u32> {
     unsafe {
         LG_mem_left = LG_mem_left.saturating_sub(len);
         LG_mem_min = LG_mem_min.min(LG_mem_left);
-        LG_mem_top = LG_mem_top.max(addr.saturating_sub(bootstrap::to_mrp_mem_addr(LG_mem_base.cast())));
+        LG_mem_top =
+            LG_mem_top.max(addr.saturating_sub(bootstrap::to_mrp_mem_addr(LG_mem_base.cast())));
     }
     Some(addr)
 }
@@ -180,7 +168,10 @@ pub extern "C" fn printMemoryInfo() {
         let origin_len = Origin_LG_mem_len;
         log!(
             ".......total:{}, min:{}, free:{}, top:{}",
-            mem_len, mem_min, mem_left, mem_top
+            mem_len,
+            mem_min,
+            mem_left,
+            mem_top
         );
         log!(".......base:{:p}, end:{:p}", mem_base, mem_end);
         log!(".......obase:{:p}, olen:{}", origin_base, origin_len);
@@ -381,79 +372,6 @@ pub extern "C" fn printScreen(filename: *mut c_char, buf: *mut u16) {
         size_of::<u16>() as u32,
     );
     file::my_close(fd);
-}
-
-pub fn mem_type_str(type_: c_int) -> *mut c_char {
-    let s: &[u8] = match type_ {
-        UC_MEM_READ => b"UC_MEM_READ\0",
-        UC_MEM_WRITE => b"UC_MEM_WRITE\0",
-        UC_MEM_FETCH => b"UC_MEM_FETCH\0",
-        UC_MEM_READ_UNMAPPED => b"UC_MEM_READ_UNMAPPED\0",
-        UC_MEM_WRITE_UNMAPPED => b"UC_MEM_WRITE_UNMAPPED\0",
-        UC_MEM_FETCH_UNMAPPED => b"UC_MEM_FETCH_UNMAPPED\0",
-        UC_MEM_WRITE_PROT => b"UC_MEM_WRITE_PROT\0",
-        UC_MEM_READ_PROT => b"UC_MEM_READ_PROT\0",
-        UC_MEM_FETCH_PROT => b"UC_MEM_FETCH_PROT\0",
-        UC_MEM_READ_AFTER => b"UC_MEM_READ_AFTER\0",
-        _ => b"<error type>\0",
-    };
-    s.as_ptr() as *mut c_char
-}
-
-pub fn cpsr_to_str(v: u32, out: *mut c_char) {
-    if out.is_null() {
-        return;
-    }
-
-    unsafe {
-        *out.add(0) = if v & (1 << 31) != 0 { b'N' } else { b'n' } as c_char;
-        *out.add(1) = if v & (1 << 30) != 0 { b'Z' } else { b'z' } as c_char;
-        *out.add(2) = if v & (1 << 29) != 0 { b'C' } else { b'c' } as c_char;
-        *out.add(3) = if v & (1 << 28) != 0 { b'V' } else { b'v' } as c_char;
-        *out.add(4) = 0;
-    }
-}
-
-fn read_reg(uc: *mut c_void, reg: RegisterARM) -> u32 {
-    unicorn::reg_read(uc, reg).unwrap_or(0)
-}
-
-pub fn dump_reg(uc: *mut c_void) {
-    let cpsr = read_reg(uc, RegisterARM::CPSR);
-    log!("==========================REG=================================");
-    log!(
-        " R0=0x{:08X}\tR1=0x{:08X}\t R2=0x{:08X}\t R3=0x{:08X}\tN:{}",
-        read_reg(uc, RegisterARM::R0),
-        read_reg(uc, RegisterARM::R1),
-        read_reg(uc, RegisterARM::R2),
-        read_reg(uc, RegisterARM::R3),
-        (cpsr & (1 << 31)) >> 31
-    );
-    log!(
-        " R4=0x{:08X}\tR5=0x{:08X}\t R6=0x{:08X}\t R7=0x{:08X}\tZ:{}",
-        read_reg(uc, RegisterARM::R4),
-        read_reg(uc, RegisterARM::R5),
-        read_reg(uc, RegisterARM::R6),
-        read_reg(uc, RegisterARM::R7),
-        (cpsr & (1 << 30)) >> 30
-    );
-    log!(
-        " R8=0x{:08X}\tR9=0x{:08X}\tR10=0x{:08X}\tR11=0x{:08X}\tC:{}",
-        read_reg(uc, RegisterARM::R8),
-        read_reg(uc, RegisterARM::R9),
-        read_reg(uc, RegisterARM::R10),
-        read_reg(uc, RegisterARM::R11),
-        (cpsr & (1 << 29)) >> 29
-    );
-    log!(
-        "R12=0x{:08X}\tSP=0x{:08X}\t LR=0x{:08X}\t PC=0x{:08X}\tV:{}",
-        read_reg(uc, RegisterARM::R12),
-        read_reg(uc, RegisterARM::SP),
-        read_reg(uc, RegisterARM::LR),
-        read_reg(uc, RegisterARM::PC),
-        (cpsr & (1 << 28)) >> 28
-    );
-    log!("==============================================================");
 }
 
 #[no_mangle]
