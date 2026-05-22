@@ -3,16 +3,64 @@
 //! The public CPU interface is [CpuBackend]. Individual backends can use
 //! Dynarmic, Unicorn, or another engine internally.
 
+#[cfg(feature = "cpu-dynarmic")]
 mod dynarmic;
+#[cfg(all(feature = "cpu-unicorn", not(feature = "cpu-dynarmic")))]
 mod unicorn;
 
 use crate::abi::GuestFunction;
 use crate::mem::{GuestUSize, Mem};
 
+#[cfg(feature = "cpu-dynarmic")]
 pub use dynarmic::{CpuContext, Dynarmic};
+#[cfg(all(feature = "cpu-unicorn", not(feature = "cpu-dynarmic")))]
 pub use unicorn::Unicorn;
 
+#[cfg(not(any(feature = "cpu-unicorn", feature = "cpu-dynarmic")))]
+compile_error!("Enable either the `cpu-unicorn` or `cpu-dynarmic` feature.");
+
 pub(super) type VAddr = u32;
+
+pub fn new_backend(direct_memory_access: bool, mem: Option<&mut Mem>) -> Box<dyn CpuBackend> {
+    #[cfg(feature = "cpu-dynarmic")]
+    {
+        return Box::new(Dynarmic::new(dynarmic_direct_memory_access(
+            direct_memory_access,
+            mem,
+        )));
+    }
+
+    #[cfg(all(not(feature = "cpu-dynarmic"), feature = "cpu-unicorn"))]
+    {
+        let direct_memory_access = match direct_memory_access {
+            true => mem,
+            false => None,
+        };
+        Box::new(Unicorn::new(direct_memory_access))
+    }
+}
+
+#[cfg(feature = "cpu-dynarmic")]
+fn dynarmic_direct_memory_access(
+    direct_memory_access: bool,
+    mem: Option<&mut Mem>,
+) -> Option<&mut Mem> {
+    let Some(mem) = mem else {
+        return None;
+    };
+
+    if !direct_memory_access {
+        return None;
+    }
+
+    let regions = unsafe { mem.direct_memory_access_regions() };
+    if regions.len() == 1 && regions[0].0 == 0 {
+        Some(mem)
+    } else {
+        log!("Dynarmic direct memory access disabled for non-contiguous guest memory.");
+        None
+    }
+}
 
 /// ARM CPU register indices and CPSR flags shared by all backends.
 pub struct Cpu;

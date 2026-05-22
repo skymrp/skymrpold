@@ -34,7 +34,7 @@ impl Environment {
 
         let mut mem = mem::Mem::new();
 
-        let cpu: Box<dyn cpu::CpuBackend> = Box::new(cpu::Unicorn::new(None));
+        let cpu = cpu::new_backend(options.direct_memory_access, None);
 
         let mut syscall = syscall::Syscall::new();
         syscall.initialize_process(&mut mem);
@@ -69,11 +69,7 @@ impl Environment {
     }
 
     pub fn rebuild_cpu_for_current_memory(&mut self) {
-        let cpu: Box<dyn cpu::CpuBackend> =
-            Box::new(cpu::Unicorn::new(match self.direct_memory_access {
-                true => Some(&mut self.mem),
-                false => None,
-            }));
+        let cpu = cpu::new_backend(self.direct_memory_access, Some(&mut self.mem));
         self.cpu = NullableBox::new(cpu);
         self.cpu.set_cpsr(cpu::Cpu::CPSR_USER_MODE);
     }
