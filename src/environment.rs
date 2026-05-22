@@ -34,7 +34,7 @@ impl Environment {
 
         let mut mem = mem::Mem::new();
 
-        let cpu: Box<dyn cpu::CpuBackend> = Box::new(cpu::UnicornCpu::new(None));
+        let cpu: Box<dyn cpu::CpuBackend> = Box::new(cpu::Unicorn::new(None));
 
         let mut syscall = syscall::Syscall::new();
         syscall.initialize_process(&mut mem);
@@ -70,7 +70,7 @@ impl Environment {
 
     pub fn rebuild_cpu_for_current_memory(&mut self) {
         let cpu: Box<dyn cpu::CpuBackend> =
-            Box::new(cpu::UnicornCpu::new(match self.direct_memory_access {
+            Box::new(cpu::Unicorn::new(match self.direct_memory_access {
                 true => Some(&mut self.mem),
                 false => None,
             }));
