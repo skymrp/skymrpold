@@ -103,24 +103,24 @@ static mut READDIR_SHARED_MEM: u32 = 0;
 static mut UPTIME_MS: u64 = 0;
 
 trait BridgeCallFromGuest: Sync {
-    fn call_from_guest(&self, entry: &BridgeEntry, ctx: &mut BridgeContext);
+    fn call_from_guest(&self, entry: &BridgeEntry, ctx: &mut BridgeContext<'_>);
 }
 
-impl BridgeCallFromGuest for fn(&BridgeEntry, &mut BridgeContext) {
-    fn call_from_guest(&self, entry: &BridgeEntry, ctx: &mut BridgeContext) {
+impl BridgeCallFromGuest for fn(&BridgeEntry, &mut BridgeContext<'_>) {
+    fn call_from_guest(&self, entry: &BridgeEntry, ctx: &mut BridgeContext<'_>) {
         self(entry, ctx);
     }
 }
 
 macro_rules! impl_bridge_call_from_guest {
     ( $($p:tt => $P:ident),* ) => {
-        impl<R, $($P),*> BridgeCallFromGuest for fn(&mut BridgeContext, $($P),*) -> R
+        impl<R, $($P),*> BridgeCallFromGuest for fn(&mut BridgeContext<'_>, $($P),*) -> R
         where
             R: GuestRet,
             $($P: GuestArg,)*
         {
             #[allow(unused_variables, unused_mut, clippy::unused_unit)]
-            fn call_from_guest(&self, _entry: &BridgeEntry, ctx: &mut BridgeContext) {
+            fn call_from_guest(&self, _entry: &BridgeEntry, ctx: &mut BridgeContext<'_>) {
                 let args: ($($P,)*) = ($(ctx.arg::<$P>($p),)*);
                 let ret = self(ctx, $(args.$p),*);
                 ctx.ret(ret);
@@ -161,7 +161,7 @@ macro_rules! entry {
             type_: BridgeMapType::Func,
             name: $name,
             init: None,
-            handler: Some(&($handler as fn(&BridgeEntry, &mut BridgeContext)) as BridgeHandler),
+            handler: Some(&($handler as fn(&BridgeEntry, &mut BridgeContext<'_>)) as BridgeHandler),
         }
     };
     ($pos:expr, func, $name:expr, typed $handler:path as $ty:ty) => {
@@ -197,30 +197,26 @@ macro_rules! entry {
             type_: BridgeMapType::Func,
             name: $name,
             init: $init,
-            handler: Some(&($handler as fn(&BridgeEntry, &mut BridgeContext)) as BridgeHandler),
+            handler: Some(&($handler as fn(&BridgeEntry, &mut BridgeContext<'_>)) as BridgeHandler),
         }
     };
 }
 
-struct BridgeContext {
-    env: *mut Environment,
+struct BridgeContext<'a> {
+    env: &'a mut Environment,
 }
 
-impl BridgeContext {
-    fn new(env: &mut Environment) -> Self {
+impl<'a> BridgeContext<'a> {
+    fn new(env: &'a mut Environment) -> Self {
         Self { env }
     }
 
-    fn uc(&self) -> *mut c_void {
-        self.env.cast::<c_void>()
-    }
-
     fn env(&self) -> &Environment {
-        unsafe { &*self.env }
+        self.env
     }
 
     fn env_mut(&mut self) -> &mut Environment {
-        unsafe { &mut *self.env }
+        self.env
     }
 
     fn arg<T: GuestArg>(&mut self, n: usize) -> T {
@@ -236,13 +232,11 @@ impl BridgeContext {
     }
 
     fn with_cstr<R>(&self, ptr: ConstPtr<u8>, f: impl FnOnce(&CStr) -> R) -> R {
-        bootstrap::with_guest_mem(|mem| {
-            let len = mem.cstr_at(ptr).len();
-            let bytes = mem.bytes_at(ptr, u32::try_from(len + 1).unwrap());
-            let cstr =
-                CStr::from_bytes_with_nul(bytes).expect("guest C string is not NUL-terminated");
-            f(cstr)
-        })
+        let mem = &self.env().mem;
+        let len = mem.cstr_at(ptr).len();
+        let bytes = mem.bytes_at(ptr, u32::try_from(len + 1).unwrap());
+        let cstr = CStr::from_bytes_with_nul(bytes).expect("guest C string is not NUL-terminated");
+        f(cstr)
     }
 
     fn with_two_cstr<R>(
@@ -251,21 +245,20 @@ impl BridgeContext {
         second: ConstPtr<u8>,
         f: impl FnOnce(&CStr, &CStr) -> R,
     ) -> R {
-        bootstrap::with_guest_mem(|mem| {
-            let first_len = mem.cstr_at(first).len();
-            let second_len = mem.cstr_at(second).len();
-            let first_bytes = mem.bytes_at(first, u32::try_from(first_len + 1).unwrap());
-            let second_bytes = mem.bytes_at(second, u32::try_from(second_len + 1).unwrap());
-            let first = CStr::from_bytes_with_nul(first_bytes)
-                .expect("guest C string is not NUL-terminated");
-            let second = CStr::from_bytes_with_nul(second_bytes)
-                .expect("guest C string is not NUL-terminated");
-            f(first, second)
-        })
+        let mem = &self.env().mem;
+        let first_len = mem.cstr_at(first).len();
+        let second_len = mem.cstr_at(second).len();
+        let first_bytes = mem.bytes_at(first, u32::try_from(first_len + 1).unwrap());
+        let second_bytes = mem.bytes_at(second, u32::try_from(second_len + 1).unwrap());
+        let first =
+            CStr::from_bytes_with_nul(first_bytes).expect("guest C string is not NUL-terminated");
+        let second =
+            CStr::from_bytes_with_nul(second_bytes).expect("guest C string is not NUL-terminated");
+        f(first, second)
     }
 
     fn with_bytes<R>(&self, ptr: ConstPtr<u8>, len: GuestUSize, f: impl FnOnce(&[u8]) -> R) -> R {
-        bootstrap::with_guest_mem(|mem| f(mem.bytes_at(ptr, len)))
+        f(self.env().mem.bytes_at(ptr, len))
     }
 
     fn with_bytes_mut<R>(
@@ -274,32 +267,32 @@ impl BridgeContext {
         len: GuestUSize,
         f: impl FnOnce(&mut [u8]) -> R,
     ) -> R {
-        bootstrap::with_guest_mem_mut(|mem| f(mem.bytes_at_mut(ptr, len)))
+        f(self.env_mut().mem.bytes_at_mut(ptr, len))
     }
 
     fn memmove(&mut self, dst: MutPtr<c_void>, src: ConstPtr<c_void>, len: GuestUSize) {
-        bootstrap::with_guest_mem_mut(|mem| mem.memmove(dst, src, len));
+        self.env_mut().mem.memmove(dst, src, len);
     }
 
     fn write_guest<T>(&mut self, ptr: MutPtr<T>, value: T)
     where
         T: SafeWrite,
     {
-        bootstrap::with_guest_mem_mut(|mem| mem.write(ptr, value));
+        self.env_mut().mem.write(ptr, value);
     }
 
     fn mem_read_u32(&self, addr: u32) -> u32 {
         self.env().mem.read(Ptr::<u32, false>::from_bits(addr))
     }
 
-    fn mem_write_u32(&self, addr: u32, value: u32) {
-        unsafe { &mut *self.env }
+    fn mem_write_u32(&mut self, addr: u32, value: u32) {
+        self.env_mut()
             .mem
             .write(MutPtr::<u32>::from_bits(addr), value);
     }
 }
 
-impl RegisterContext for BridgeContext {
+impl RegisterContext for BridgeContext<'_> {
     fn read_reg(&mut self, reg: AbiReg) -> u32 {
         self.env_mut().cpu.regs()[abi_reg_index(reg)]
     }
@@ -309,7 +302,7 @@ impl RegisterContext for BridgeContext {
     }
 }
 
-impl StackMemoryContext for BridgeContext {
+impl StackMemoryContext for BridgeContext<'_> {
     fn read_stack_u32(&mut self, sp: u32, word_offset: usize) -> u32 {
         self.mem_read_u32(sp + u32::try_from(word_offset).unwrap() * 4)
     }
@@ -350,8 +343,8 @@ fn hooks_init(env: &mut Environment, map: &'static [BridgeEntry], table_size: u3
         .iter()
         .filter(|obj| obj.type_ == BridgeMapType::Func)
         .count() as u32;
-    let ptr = compat::malloc_ext(table_size + func_count * 8);
-    let start_address = bootstrap::to_mrp_mem_addr(ptr);
+    let ptr = compat::malloc_ext_in(&mut env.mem, table_size + func_count * 8);
+    let start_address = bootstrap::to_mrp_mem_addr(&env.mem, ptr);
     let mut stub_address = start_address + table_size;
 
     for obj in map {
@@ -372,9 +365,7 @@ fn hooks_init(env: &mut Environment, map: &'static [BridgeEntry], table_size: u3
                     obj.name,
                     obj as &'static dyn CallFromGuest,
                 );
-                bootstrap::with_guest_mem_mut(|mem| {
-                    mem.write(MutPtr::<u32>::from_bits(addr), stub_address);
-                });
+                env.mem.write(MutPtr::<u32>::from_bits(addr), stub_address);
                 log!("[SVC] linked {} pos=0x{:X} svc=#{svc}", obj.name, obj.pos);
                 stub_address += 8;
             }
@@ -386,24 +377,24 @@ fn hooks_init(env: &mut Environment, map: &'static [BridgeEntry], table_size: u3
 fn br_mr_c_function_new(ctx: &mut BridgeContext, p_f: u32, p_len: u32) -> u32 {
     log!("ext call _mr_c_function_new(0x{p_f:X}[{p_f}], 0x{p_len:X}[{p_len}])");
 
-    let mr_c_function_p = compat::malloc_ext(p_len) as *mut MrCFunctionP;
+    let mr_c_function_p = compat::malloc_ext_in(&mut ctx.env_mut().mem, p_len) as *mut MrCFunctionP;
     unsafe {
         MR_EXT_HELPER_ADDR = p_f;
         MR_C_FUNCTION_P = mr_c_function_p;
         ptr::write_bytes(mr_c_function_p as *mut u8, 0, p_len as usize);
     }
 
-    let v = bootstrap::to_mrp_mem_addr(mr_c_function_p as *mut c_void);
+    let v = bootstrap::to_mrp_mem_addr(&ctx.env().mem, mr_c_function_p as *mut c_void);
     ctx.mem_write_u32(CODE_ADDRESS + 4, v);
     MR_SUCCESS as u32
 }
 
-fn br_mr_malloc(_ctx: &mut BridgeContext, len: u32) -> MutPtr<c_void> {
-    compat::malloc_ext_guest(len)
+fn br_mr_malloc(ctx: &mut BridgeContext, len: u32) -> MutPtr<c_void> {
+    compat::malloc_ext_guest_in(&mut ctx.env_mut().mem, len)
 }
 
-fn br_mr_free(_ctx: &mut BridgeContext, p: MutPtr<c_void>) {
-    compat::free_ext_guest(p);
+fn br_mr_free(ctx: &mut BridgeContext, p: MutPtr<c_void>) {
+    compat::free_ext_guest_in(&mut ctx.env_mut().mem, p);
 }
 
 fn br_memcpy(
@@ -497,7 +488,7 @@ fn br_log(ctx: &mut BridgeContext, msg: ConstPtr<u8>) {
 
 fn br_mem_get(ctx: &mut BridgeContext, mem_base: MutPtr<u32>, mem_len: MutPtr<u32>) -> u32 {
     let len = 1024 * 1024 * 4u32;
-    let buffer = compat::malloc_ext_guest(len);
+    let buffer = compat::malloc_ext_guest_in(&mut ctx.env_mut().mem, len);
     log!(
         "br_mem_get base=0x{:X} len={len}({} kb) =================",
         buffer.to_bits(),
@@ -508,8 +499,8 @@ fn br_mem_get(ctx: &mut BridgeContext, mem_base: MutPtr<u32>, mem_len: MutPtr<u3
     MR_SUCCESS as u32
 }
 
-fn br_mem_free(_ctx: &mut BridgeContext, mem: MutPtr<c_void>) -> u32 {
-    compat::free_ext_guest(mem);
+fn br_mem_free(ctx: &mut BridgeContext, mem: MutPtr<c_void>) -> u32 {
+    compat::free_ext_guest_in(&mut ctx.env_mut().mem, mem);
     MR_SUCCESS as u32
 }
 
@@ -554,21 +545,21 @@ fn br_opendir(ctx: &mut BridgeContext, name: ConstPtr<u8>) -> u32 {
 }
 
 fn br_readdir_init(_o: &BridgeEntry, env: &mut Environment, addr: u32) {
-    let shared_mem = compat::malloc_ext_guest(READDIR_SHARED_MEM_SIZE as u32).to_bits();
+    let shared_mem =
+        compat::malloc_ext_guest_in(&mut env.mem, READDIR_SHARED_MEM_SIZE as u32).to_bits();
     unsafe {
         READDIR_SHARED_MEM = shared_mem;
     }
-    bootstrap::with_guest_mem_mut(|mem| {
-        mem.bytes_at_mut(
+    env.mem
+        .bytes_at_mut(
             MutPtr::<u8>::from_bits(shared_mem),
             READDIR_SHARED_MEM_SIZE as u32,
         )
         .fill(0);
-    });
     env.mem.write(MutPtr::<u32>::from_bits(addr), addr);
 }
 
-fn br_readdir(_ctx: &mut BridgeContext, f: u32) -> u32 {
+fn br_readdir(ctx: &mut BridgeContext, f: u32) -> u32 {
     let Some(name) = file::readdir_name(f as c_int) else {
         return 0;
     };
@@ -577,14 +568,12 @@ fn br_readdir(_ctx: &mut BridgeContext, f: u32) -> u32 {
         return 0;
     }
     let len = name.len().min(READDIR_SHARED_MEM_SIZE - 1);
-    bootstrap::with_guest_mem_mut(|mem| {
-        let bytes = mem.bytes_at_mut(
-            MutPtr::<u8>::from_bits(shared_mem),
-            READDIR_SHARED_MEM_SIZE as u32,
-        );
-        bytes.fill(0);
-        bytes[..len].copy_from_slice(&name[..len]);
-    });
+    let bytes = ctx.env_mut().mem.bytes_at_mut(
+        MutPtr::<u8>::from_bits(shared_mem),
+        READDIR_SHARED_MEM_SIZE as u32,
+    );
+    bytes.fill(0);
+    bytes[..len].copy_from_slice(&name[..len]);
     shared_mem
 }
 
@@ -607,14 +596,7 @@ fn br_get_datetime(ctx: &mut BridgeContext, datetime: MutPtr<c_void>) -> u32 {
 }
 
 fn br_mr_init_network(ctx: &mut BridgeContext, cb: u32, mode: ConstPtr<u8>, user_data: u32) -> u32 {
-    ctx.with_cstr(mode, |mode| {
-        network::init_network_cstr(
-            ctx.uc(),
-            cb as usize as *mut c_void,
-            mode,
-            user_data as usize as *mut c_void,
-        )
-    }) as u32
+    ctx.with_cstr(mode, |mode| network::init_network_cstr(cb, mode, user_data)) as u32
 }
 
 fn br_mr_socket(_ctx: &mut BridgeContext, type_: u32, protocol: u32) -> u32 {
@@ -640,12 +622,7 @@ fn br_mr_get_host_by_name(
     user_data: u32,
 ) -> u32 {
     ctx.with_cstr(name, |name| {
-        network::get_host_by_name_cstr(
-            ctx.uc(),
-            name,
-            cb as usize as *mut c_void,
-            user_data as usize as *mut c_void,
-        )
+        network::get_host_by_name_cstr(name, cb, user_data)
     }) as u32
 }
 
@@ -732,12 +709,12 @@ fn br_mr_edit_create(
     }) as u32
 }
 
-fn br_mr_edit_release(_ctx: &mut BridgeContext, _edit: u32) -> u32 {
-    window::edit_release() as u32
+fn br_mr_edit_release(ctx: &mut BridgeContext, _edit: u32) -> u32 {
+    window::edit_release(&mut ctx.env_mut().mem) as u32
 }
 
-fn br_mr_edit_get_text(_ctx: &mut BridgeContext, _edit: u32) -> u32 {
-    bootstrap::to_mrp_mem_addr(window::edit_get_text() as *mut c_void)
+fn br_mr_edit_get_text(ctx: &mut BridgeContext, _edit: u32) -> u32 {
+    bootstrap::to_mrp_mem_addr(&ctx.env().mem, window::edit_get_text() as *mut c_void)
 }
 
 static MR_TABLE_FUNC_MAP: &[BridgeEntry] = &[
@@ -968,14 +945,17 @@ pub fn bridge_init(env: &mut Environment) -> c_int {
         DSM_REQUIRE_FUNCS = hooks_init(env, DSM_REQUIRE_FUNCS_MAP, DSM_REQUIRE_FUNCS_SIZE);
     }
     let dsm_require_funcs = unsafe { DSM_REQUIRE_FUNCS };
-    let flags_addr = bootstrap::to_mrp_mem_addr(dsm_require_funcs) + 0xcc;
+    let flags_addr = bootstrap::to_mrp_mem_addr(&env.mem, dsm_require_funcs) + 0xcc;
     env.mem
         .write(MutPtr::<u32>::from_bits(flags_addr), FLAG_USE_UTF8_EDIT);
 
     unsafe {
-        MR_C_EVENT = compat::malloc_ext(std::mem::size_of::<Event>() as u32) as *mut Event;
-        DSM_EVENT = compat::malloc_ext(std::mem::size_of::<Event>() as u32) as *mut Event;
-        MR_START_DSM_PARAM = compat::malloc_ext(std::mem::size_of::<Start>() as u32) as *mut Start;
+        MR_C_EVENT =
+            compat::malloc_ext_in(&mut env.mem, std::mem::size_of::<Event>() as u32) as *mut Event;
+        DSM_EVENT =
+            compat::malloc_ext_in(&mut env.mem, std::mem::size_of::<Event>() as u32) as *mut Event;
+        MR_START_DSM_PARAM =
+            compat::malloc_ext_in(&mut env.mem, std::mem::size_of::<Start>() as u32) as *mut Start;
     }
     MR_SUCCESS
 }
@@ -983,7 +963,7 @@ pub fn bridge_init(env: &mut Environment) -> c_int {
 pub fn bridge_ext_init(env: &mut Environment) -> c_int {
     let mut ctx = BridgeContext::new(env);
     let mr_table = unsafe { MR_TABLE };
-    let mut v = bootstrap::to_mrp_mem_addr(mr_table);
+    let mut v = bootstrap::to_mrp_mem_addr(&ctx.env().mem, mr_table);
     ctx.mem_write_u32(CODE_ADDRESS, v);
 
     v = 1;
@@ -1002,7 +982,7 @@ pub fn bridge_ext_init(env: &mut Environment) -> c_int {
 fn bridge_mr_ext_helper(env: &mut Environment, code: u32, input: u32, input_len: u32) -> c_int {
     let mut ctx = BridgeContext::new(env);
     let mr_c_function_p = unsafe { MR_C_FUNCTION_P };
-    let p = bootstrap::to_mrp_mem_addr(mr_c_function_p as *mut c_void);
+    let p = bootstrap::to_mrp_mem_addr(&ctx.env().mem, mr_c_function_p as *mut c_void);
     ctx.write_reg(AbiReg::R0, p);
     ctx.write_reg(AbiReg::R1, code);
     ctx.write_reg(AbiReg::R2, input);
@@ -1023,14 +1003,13 @@ fn bridge_mr_event(env: &mut Environment, code: c_int, param0: c_int, param1: c_
     bridge_mr_ext_helper(
         env,
         1,
-        bootstrap::to_mrp_mem_addr(mr_c_event as *mut c_void),
+        bootstrap::to_mrp_mem_addr(&env.mem, mr_c_event as *mut c_void),
         std::mem::size_of::<Event>() as u32,
     )
 }
 
-pub fn bridge_dsm_network_cb(env: *mut c_void, addr: u32, p0: c_int, p1: u32) -> c_int {
+pub fn bridge_dsm_network_cb(env: &mut Environment, callback: network::NetworkCallback) -> c_int {
     let _guard = BRIDGE_LOCK.lock().unwrap();
-    let env = unsafe { &mut *env.cast::<Environment>() };
     let mut ctx = BridgeContext::new(env);
     let r9 = ctx.read_reg(AbiReg::R9);
 
@@ -1038,12 +1017,18 @@ pub fn bridge_dsm_network_cb(env: *mut c_void, addr: u32, p0: c_int, p1: u32) ->
     if !mr_c_function_p.is_null() {
         ctx.write_reg(AbiReg::R9, unsafe { (*mr_c_function_p).start_of_er_rw });
     }
-    ctx.write_reg(AbiReg::R0, p0 as u32);
-    ctx.write_reg(AbiReg::R1, p1);
-    run_code(ctx.env_mut(), addr, false);
+    ctx.write_reg(AbiReg::R0, callback.result as u32);
+    ctx.write_reg(AbiReg::R1, callback.user_data);
+    run_code(ctx.env_mut(), callback.addr, false);
 
     ctx.write_reg(AbiReg::R9, r9);
     ctx.arg::<u32>(0) as c_int
+}
+
+pub fn bridge_drain_network_callbacks(env: &mut Environment) {
+    for callback in network::drain_callbacks() {
+        let _ = bridge_dsm_network_cb(env, callback);
+    }
 }
 
 pub fn bridge_dsm_mr_start_dsm(
@@ -1056,16 +1041,16 @@ pub fn bridge_dsm_mr_start_dsm(
 
     let start_param = unsafe { MR_START_DSM_PARAM };
     unsafe {
-        (*start_param).filename = compat::copy_str_to_mrp(filename);
-        (*start_param).ext = compat::copy_str_to_mrp(ext);
+        (*start_param).filename = compat::copy_str_to_mrp_in(&mut env.mem, filename);
+        (*start_param).ext = compat::copy_str_to_mrp_in(&mut env.mem, ext);
         (*start_param).entry = if entry.is_null() {
             0
         } else {
-            compat::copy_str_to_mrp(entry)
+            compat::copy_str_to_mrp_in(&mut env.mem, entry)
         };
     }
 
-    let input = bootstrap::to_mrp_mem_addr(start_param as *mut c_void) as c_int;
+    let input = bootstrap::to_mrp_mem_addr(&env.mem, start_param as *mut c_void) as c_int;
     let ret = bridge_mr_event(env, MR_START_DSM, input, 0);
 
     let (filename_addr, ext_addr, entry_addr) = unsafe {
@@ -1075,17 +1060,20 @@ pub fn bridge_dsm_mr_start_dsm(
             (*start_param).entry,
         )
     };
-    compat::free_ext(bootstrap::get_mrp_mem_ptr(filename_addr));
+    let filename_ptr = bootstrap::get_mrp_mem_ptr(&mut env.mem, filename_addr);
+    compat::free_ext_in(&mut env.mem, filename_ptr);
     unsafe {
         (*start_param).filename = 0;
     }
-    compat::free_ext(bootstrap::get_mrp_mem_ptr(ext_addr));
+    let ext_ptr = bootstrap::get_mrp_mem_ptr(&mut env.mem, ext_addr);
+    compat::free_ext_in(&mut env.mem, ext_ptr);
     unsafe {
         (*start_param).ext = 0;
     }
 
     if !entry.is_null() {
-        compat::free_ext(bootstrap::get_mrp_mem_ptr(entry_addr));
+        let entry_ptr = bootstrap::get_mrp_mem_ptr(&mut env.mem, entry_addr);
+        compat::free_ext_in(&mut env.mem, entry_ptr);
         unsafe {
             (*start_param).entry = 0;
         }
@@ -1119,7 +1107,7 @@ pub fn bridge_dsm_mr_event(env: &mut Environment, code: c_int, p0: c_int, p1: c_
     bridge_mr_event(
         env,
         MR_EVENT,
-        bootstrap::to_mrp_mem_addr(dsm_event as *mut c_void) as c_int,
+        bootstrap::to_mrp_mem_addr(&env.mem, dsm_event as *mut c_void) as c_int,
         0,
     )
 }
@@ -1131,7 +1119,7 @@ pub fn bridge_dsm_init(env: &mut Environment) -> c_int {
         bridge_mr_event(
             env,
             DSM_INIT,
-            bootstrap::to_mrp_mem_addr(dsm_require_funcs) as c_int,
+            bootstrap::to_mrp_mem_addr(&env.mem, dsm_require_funcs) as c_int,
             0,
         )
     };

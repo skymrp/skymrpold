@@ -1,4 +1,4 @@
-use crate::{audio, compat, paths, Environment};
+use crate::{audio, compat, mem::Mem, paths, Environment};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
@@ -162,14 +162,15 @@ pub fn edit_create_cstr(_title: &CStr, _text: &CStr, _type_: c_int, max_size: c_
 
 #[no_mangle]
 pub extern "C" fn editRelease(_edit: c_int) -> c_int {
-    edit_release()
+    log!("editRelease called without guest memory context");
+    0
 }
 
-pub fn edit_release() -> c_int {
+pub fn edit_release(mem: &mut Mem) -> c_int {
     *EDIT_MODE.lock().unwrap() = false;
     let mut ptr = HOLD_EDIT_TEXT_PTR.lock().unwrap();
     if !ptr.0.is_null() {
-        compat::free_ext(ptr.0 as *mut c_void);
+        compat::free_ext_in(mem, ptr.0 as *mut c_void);
         ptr.0 = std::ptr::null_mut();
     }
     0
@@ -184,7 +185,7 @@ pub fn edit_get_text() -> *mut c_char {
     HOLD_EDIT_TEXT_PTR.lock().unwrap().0
 }
 
-fn save_edit_text(s: &str) {
+fn save_edit_text(mem: &mut Mem, s: &str) {
     let max_size = *EDIT_MAX_SIZE.lock().unwrap();
     let mut count = 0;
     let mut byte_len = 0;
@@ -199,13 +200,13 @@ fn save_edit_text(s: &str) {
 
     let mut ptr = HOLD_EDIT_TEXT_PTR.lock().unwrap();
     if !ptr.0.is_null() {
-        compat::free_ext(ptr.0 as *mut c_void);
+        compat::free_ext_in(mem, ptr.0 as *mut c_void);
         ptr.0 = std::ptr::null_mut();
     }
 
     let c_str = std::ffi::CString::new(truncated).unwrap();
     let bytes = c_str.as_bytes_with_nul();
-    let allocated = compat::malloc_ext(bytes.len() as u32);
+    let allocated = compat::malloc_ext_in(mem, bytes.len() as u32);
     if !allocated.is_null() {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), allocated as *mut u8, bytes.len());
@@ -309,7 +310,7 @@ pub fn run(env: &mut Environment) -> Result<(), String> {
                         || keymod.contains(sdl2::keyboard::Mod::RCTRLMOD) =>
                     {
                         if let Ok(text) = canvas.window().subsystem().clipboard().clipboard_text() {
-                            save_edit_text(&text);
+                            save_edit_text(&mut env.mem, &text);
                         }
                         env.event(MR_DIALOG_EVENT, 0, 0);
                     }
@@ -374,6 +375,8 @@ pub fn run(env: &mut Environment) -> Result<(), String> {
         if should_trigger_timer {
             env.timer();
         }
+
+        env.poll_network_callbacks();
 
         {
             let fb = FRAME_BUFFER.lock().unwrap();

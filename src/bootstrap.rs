@@ -1,10 +1,9 @@
 pub(crate) mod bridge;
 
 use crate::environment::Environment;
-use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MemRegion, MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{GuestUSize, Mem, MemRegion, MutPtr, Ptr};
 use crate::{compat, file};
 use libc::{c_char, c_int, c_void};
-use std::cell::Cell;
 use std::ffi::CStr;
 use std::ptr;
 
@@ -25,9 +24,6 @@ const TOTAL_MEMORY: u32 = END_ADDRESS - START_ADDRESS;
 
 static mut MRP_MEM: *mut u8 = ptr::null_mut();
 static mut LOW_MEM: *mut u8 = ptr::null_mut();
-thread_local! {
-    static GUEST_MEM: Cell<*mut Mem> = const { Cell::new(ptr::null_mut()) };
-}
 
 pub struct Bootstrap;
 
@@ -86,84 +82,26 @@ impl Drop for Bootstrap {
     }
 }
 
-fn set_guest_mem(mem: *mut Mem) {
-    GUEST_MEM.with(|guest_mem| {
-        guest_mem.set(mem);
-    });
+pub fn guest_host_ptr_mut(mem: &mut Mem, addr: u32, count: GuestUSize) -> *mut c_void {
+    mem.ptr_at_mut(Ptr::<u8, true>::from_bits(addr), count)
+        .cast::<c_void>()
 }
 
-pub fn with_guest_mem<R>(f: impl FnOnce(&Mem) -> R) -> R {
-    GUEST_MEM.with(|guest_mem| {
-        let mem = guest_mem.get();
-        assert!(!mem.is_null(), "guest memory is not initialized");
-        f(unsafe { &*mem })
-    })
+pub fn get_mrp_mem_ptr(mem: &mut Mem, addr: u32) -> *mut c_void {
+    let ptr = MutPtr::<u8>::from_bits(addr);
+    mem.get_bytes_fallible_mut(ptr.cast_const().cast_void(), 1)
+        .map_or(ptr::null_mut(), |bytes| bytes.as_mut_ptr().cast())
 }
 
-pub fn with_guest_mem_mut<R>(f: impl FnOnce(&mut Mem) -> R) -> R {
-    GUEST_MEM.with(|guest_mem| {
-        let mem = guest_mem.get();
-        assert!(!mem.is_null(), "guest memory is not initialized");
-        f(unsafe { &mut *mem })
-    })
-}
-
-pub fn guest_alloc(size: GuestUSize) -> MutVoidPtr {
-    with_guest_mem_mut(|mem| mem.alloc(size))
-}
-
-pub fn guest_calloc(size: GuestUSize) -> MutVoidPtr {
-    with_guest_mem_mut(|mem| mem.calloc(size))
-}
-
-pub fn guest_realloc(ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {
-    with_guest_mem_mut(|mem| mem.realloc(ptr, size))
-}
-
-pub fn guest_malloc_size(ptr: ConstVoidPtr) -> GuestUSize {
-    with_guest_mem_mut(|mem| mem.malloc_size(ptr))
-}
-
-pub fn guest_free(ptr: MutVoidPtr) {
-    with_guest_mem_mut(|mem| mem.free(ptr));
-}
-
-pub fn guest_host_ptr_mut(addr: u32, count: GuestUSize) -> *mut c_void {
-    with_guest_mem_mut(|mem| {
-        mem.ptr_at_mut(Ptr::<u8, true>::from_bits(addr), count)
-            .cast::<c_void>()
-    })
-}
-
-pub fn get_mrp_mem_ptr(addr: u32) -> *mut c_void {
-    GUEST_MEM.with(|guest_mem| {
-        let mem = guest_mem.get();
-        if mem.is_null() {
-            return ptr::null_mut();
-        }
-        let ptr = MutPtr::<u8>::from_bits(addr);
-        unsafe { &mut *mem }
-            .get_bytes_fallible_mut(ptr.cast_const().cast_void(), 1)
-            .map_or(ptr::null_mut(), |bytes| bytes.as_mut_ptr().cast())
-    })
-}
-
-pub fn to_mrp_mem_addr(ptr: *mut c_void) -> u32 {
+pub fn to_mrp_mem_addr(mem: &Mem, ptr: *mut c_void) -> u32 {
     if ptr.is_null() {
         return 0;
     }
-    GUEST_MEM.with(|guest_mem| {
-        let mem = guest_mem.get();
-        assert!(!mem.is_null(), "guest memory is not initialized");
-        unsafe { &*mem }
-            .host_ptr_to_guest_ptr(ptr.cast_const())
-            .to_bits()
-    })
+    mem.host_ptr_to_guest_ptr(ptr.cast_const()).to_bits()
 }
 
 pub fn free_bootstrap() -> c_int {
     unsafe {
-        set_guest_mem(ptr::null_mut());
         MRP_MEM = ptr::null_mut();
         LOW_MEM = ptr::null_mut();
     }
@@ -196,9 +134,7 @@ pub fn init_bootstrap(env: &mut Environment) -> c_int {
                 _ => {}
             }
         }
-        set_guest_mem((&mut *env.mem) as *mut Mem);
-
-        compat::init_memory_manager(MEMORY_MANAGER_ADDRESS, MEMORY_MANAGER_SIZE);
+        compat::init_memory_manager(&mut env.mem, MEMORY_MANAGER_ADDRESS, MEMORY_MANAGER_SIZE);
         Ok(())
     })();
 

@@ -1,6 +1,6 @@
-use crate::bootstrap::bridge;
 use libc::{c_char, c_int, c_ushort, c_void};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::io;
 use std::net::{Ipv4Addr, ToSocketAddrs};
@@ -27,6 +27,7 @@ struct NetworkState {
     is_cmwap: bool,
     next_socket: c_int,
     sockets: HashMap<c_int, Arc<Mutex<SocketEntry>>>,
+    pending_callbacks: VecDeque<NetworkCallback>,
 }
 
 struct SocketEntry {
@@ -39,13 +40,11 @@ struct SocketEntry {
 }
 
 #[derive(Clone, Copy)]
-struct NetworkCallback {
-    uc: usize,
-    addr: u32,
-    user_data: u32,
+pub struct NetworkCallback {
+    pub addr: u32,
+    pub result: c_int,
+    pub user_data: u32,
 }
-
-unsafe impl Send for NetworkCallback {}
 
 static NETWORK: OnceLock<Mutex<NetworkState>> = OnceLock::new();
 
@@ -55,6 +54,7 @@ fn network() -> &'static Mutex<NetworkState> {
             is_cmwap: false,
             next_socket: 0,
             sockets: HashMap::new(),
+            pending_callbacks: VecDeque::new(),
         })
     })
 }
@@ -176,24 +176,26 @@ fn resolve_host_ipv4(name: &str) -> c_int {
 }
 
 fn invoke_network_callback(callback: NetworkCallback, result: c_int) {
-    bridge::bridge_dsm_network_cb(
-        callback.uc as *mut c_void,
-        callback.addr,
-        result,
-        callback.user_data,
-    );
+    if let Ok(mut state) = network().lock() {
+        state
+            .pending_callbacks
+            .push_back(NetworkCallback { result, ..callback });
+    }
 }
 
-fn callback_from_parts(
-    uc: *mut c_void,
-    cb: *mut c_void,
-    user_data: *mut c_void,
-) -> NetworkCallback {
+fn callback_from_parts(cb: u32, user_data: u32) -> NetworkCallback {
     NetworkCallback {
-        uc: uc as usize,
-        addr: cb as usize as u32,
-        user_data: user_data as usize as u32,
+        addr: cb,
+        result: MR_FAILED,
+        user_data,
     }
+}
+
+pub fn drain_callbacks() -> Vec<NetworkCallback> {
+    network()
+        .lock()
+        .map(|mut state| state.pending_callbacks.drain(..).collect())
+        .unwrap_or_default()
 }
 
 fn check_fd(fd: RawFd, write: bool) -> c_int {
@@ -391,21 +393,16 @@ pub fn close_network() -> c_int {
     ret
 }
 
-pub fn init_network_cstr(
-    uc: *mut c_void,
-    cb: *mut c_void,
-    mode: &CStr,
-    user_data: *mut c_void,
-) -> c_int {
+pub fn init_network_cstr(cb: u32, mode: &CStr, user_data: u32) -> c_int {
     let mode = cstr_ref_to_string(mode);
-    log!("my_initNetwork(0x{:p}, '{mode}')", cb);
+    log!("my_initNetwork(0x{cb:X}, '{mode}')");
     network().lock().unwrap().is_cmwap = mode.to_ascii_lowercase().starts_with("cmwap");
 
-    if cb.is_null() {
+    if cb == 0 {
         return MR_SUCCESS;
     }
 
-    let callback = callback_from_parts(uc, cb, user_data);
+    let callback = callback_from_parts(cb, user_data);
     if thread::Builder::new()
         .name("skymrp-network-init".to_owned())
         .spawn(move || {
@@ -420,20 +417,15 @@ pub fn init_network_cstr(
     MR_WAITING
 }
 
-pub fn get_host_by_name_cstr(
-    uc: *mut c_void,
-    name: &CStr,
-    cb: *mut c_void,
-    user_data: *mut c_void,
-) -> c_int {
+pub fn get_host_by_name_cstr(name: &CStr, cb: u32, user_data: u32) -> c_int {
     let name = cstr_ref_to_string(name);
-    log!("my_getHostByName('{name}', 0x{:p})", cb);
+    log!("my_getHostByName('{name}', 0x{cb:X})");
 
-    if cb.is_null() {
+    if cb == 0 {
         return resolve_host_ipv4(&name);
     }
 
-    let callback = callback_from_parts(uc, cb, user_data);
+    let callback = callback_from_parts(cb, user_data);
     if thread::Builder::new()
         .name("skymrp-network-dns".to_owned())
         .spawn(move || {
@@ -593,7 +585,7 @@ pub fn recv(s: c_int, buf: &mut [u8]) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn my_initNetwork(
-    uc: *mut c_void,
+    _uc: *mut c_void,
     cb: *mut c_void,
     mode: *const c_char,
     user_data: *mut c_void,
@@ -601,12 +593,16 @@ pub extern "C" fn my_initNetwork(
     if mode.is_null() {
         return MR_FAILED;
     }
-    init_network_cstr(uc, cb, unsafe { CStr::from_ptr(mode) }, user_data)
+    init_network_cstr(
+        cb as usize as u32,
+        unsafe { CStr::from_ptr(mode) },
+        user_data as usize as u32,
+    )
 }
 
 #[no_mangle]
 pub extern "C" fn my_getHostByName(
-    uc: *mut c_void,
+    _uc: *mut c_void,
     name: *const c_char,
     cb: *mut c_void,
     user_data: *mut c_void,
@@ -614,7 +610,11 @@ pub extern "C" fn my_getHostByName(
     if name.is_null() {
         return MR_FAILED;
     }
-    get_host_by_name_cstr(uc, unsafe { CStr::from_ptr(name) }, cb, user_data)
+    get_host_by_name_cstr(
+        unsafe { CStr::from_ptr(name) },
+        cb as usize as u32,
+        user_data as usize as u32,
+    )
 }
 
 #[no_mangle]

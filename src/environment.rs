@@ -94,6 +94,10 @@ impl Environment {
         ret
     }
 
+    pub fn poll_network_callbacks(&mut self) {
+        bootstrap::bridge::bridge_drain_network_callbacks(self);
+    }
+
     /// Run the emulator until the app returns control to the host. This is for
     /// host-to-guest function calls (see [abi::CallFromHost::call_from_host]).
     ///

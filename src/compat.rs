@@ -1,6 +1,6 @@
 use crate::bootstrap;
 use crate::file;
-use crate::mem::{MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{Mem, MutPtr, MutVoidPtr, Ptr};
 use libc::{c_char, c_int, c_uchar, c_void, size_t};
 use std::ffi::CStr;
 use std::ptr;
@@ -44,37 +44,36 @@ fn real_lg_mem_size(len: u32) -> u32 {
     len.wrapping_add(7) & 0xfffffff8
 }
 
-fn alloc_guest(len: u32) -> Option<u32> {
-    let addr = bootstrap::with_guest_mem_mut(|mem| mem.try_alloc(len).map(|ptr| ptr.to_bits()))?;
+fn alloc_guest(mem: &mut Mem, len: u32) -> Option<u32> {
+    let addr = mem.try_alloc(len).map(|ptr| ptr.to_bits())?;
     unsafe {
         LG_mem_left = LG_mem_left.saturating_sub(len);
         LG_mem_min = LG_mem_min.min(LG_mem_left);
-        LG_mem_top =
-            LG_mem_top.max(addr.saturating_sub(bootstrap::to_mrp_mem_addr(LG_mem_base.cast())));
+        LG_mem_top = LG_mem_top
+            .max(addr.saturating_sub(bootstrap::to_mrp_mem_addr(mem, LG_mem_base.cast())));
     }
     Some(addr)
 }
 
-fn free_guest(addr: u32) -> u32 {
+fn free_guest(mem: &mut Mem, addr: u32) -> u32 {
     if addr == 0 {
         return 0;
     }
-    let freed =
-        bootstrap::with_guest_mem_mut(|mem| mem.free_with_size(MutVoidPtr::from_bits(addr)));
+    let freed = mem.free_with_size(MutVoidPtr::from_bits(addr));
     unsafe {
         LG_mem_left = LG_mem_left.saturating_add(freed).min(LG_mem_len);
     }
     freed
 }
 
-fn guest_host_ptr(addr: u32, count: u32) -> *mut c_void {
-    bootstrap::guest_host_ptr_mut(addr, count)
+fn guest_host_ptr(mem: &mut Mem, addr: u32, count: u32) -> *mut c_void {
+    bootstrap::guest_host_ptr_mut(mem, addr, count)
 }
 
-pub fn init_memory_manager(base_address: u32, len: u32) {
+pub fn init_memory_manager(mem: &mut Mem, base_address: u32, len: u32) {
     log!("init_memory_manager: baseAddress:0x{base_address:X} len: 0x{len:X}");
     unsafe {
-        Origin_LG_mem_base = bootstrap::guest_host_ptr_mut(base_address, 1) as *mut c_char;
+        Origin_LG_mem_base = bootstrap::guest_host_ptr_mut(mem, base_address, 1) as *mut c_char;
         Origin_LG_mem_len = len;
 
         LG_mem_base = ((Origin_LG_mem_base.add(3) as usize) & !3usize) as *mut c_char;
@@ -112,6 +111,12 @@ pub extern "C" fn printMemoryInfo() {
 
 #[no_mangle]
 pub extern "C" fn my_malloc(mut len: u32) -> *mut c_void {
+    log!("my_malloc called without guest memory context");
+    let _ = &mut len;
+    ptr::null_mut()
+}
+
+pub fn my_malloc_in(mem: &mut Mem, mut len: u32) -> *mut c_void {
     len = real_lg_mem_size(len);
     if len == 0 {
         log!("my_malloc invalid memory request");
@@ -121,161 +126,175 @@ pub extern "C" fn my_malloc(mut len: u32) -> *mut c_void {
         log!("my_malloc no memory");
         return ptr::null_mut();
     }
-    let Some(addr) = alloc_guest(len) else {
+    let Some(addr) = alloc_guest(mem, len) else {
         log!("my_malloc no memory");
         return ptr::null_mut();
     };
-    guest_host_ptr(addr, len)
+    guest_host_ptr(mem, addr, len)
 }
 
 #[no_mangle]
 pub extern "C" fn my_free(p: *mut c_void, _len: u32) {
+    if !p.is_null() {
+        log!("my_free called without guest memory context");
+    }
+}
+
+pub fn my_free_in(mem: &mut Mem, p: *mut c_void, _len: u32) {
     if p.is_null() {
         return;
     }
-    let addr = bootstrap::to_mrp_mem_addr(p);
-    let _ = free_guest(addr);
+    let addr = bootstrap::to_mrp_mem_addr(mem, p);
+    let _ = free_guest(mem, addr);
 }
 
 #[no_mangle]
 pub extern "C" fn my_realloc(p: *mut c_void, oldlen: u32, len: u32) -> *mut c_void {
+    let _ = (p, oldlen, len);
+    log!("my_realloc called without guest memory context");
+    ptr::null_mut()
+}
+
+pub fn my_realloc_in(mem: &mut Mem, p: *mut c_void, oldlen: u32, len: u32) -> *mut c_void {
     if p.is_null() {
-        return my_malloc(len);
+        return my_malloc_in(mem, len);
     }
     if len == 0 {
-        my_free(p, oldlen);
+        my_free_in(mem, p, oldlen);
         return ptr::null_mut();
     }
     let new_len = real_lg_mem_size(len);
-    let Some(new_addr) = alloc_guest(new_len) else {
+    let Some(new_addr) = alloc_guest(mem, new_len) else {
         return ptr::null_mut();
     };
-    let old_addr = bootstrap::to_mrp_mem_addr(p);
-    bootstrap::with_guest_mem_mut(|mem| {
-        mem.memmove(
-            MutPtr::<c_void>::from_bits(new_addr),
-            Ptr::<c_void, false>::from_bits(old_addr),
-            oldlen.min(len),
-        );
-    });
-    let _ = free_guest(old_addr);
-    guest_host_ptr(new_addr, len)
+    let old_addr = bootstrap::to_mrp_mem_addr(mem, p);
+    mem.memmove(
+        MutPtr::<c_void>::from_bits(new_addr),
+        Ptr::<c_void, false>::from_bits(old_addr),
+        oldlen.min(len),
+    );
+    let _ = free_guest(mem, old_addr);
+    guest_host_ptr(mem, new_addr, len)
 }
 
-pub fn malloc_ext(len: u32) -> *mut c_void {
-    let ptr = malloc_ext_guest(len);
+pub fn malloc_ext_in(mem: &mut Mem, len: u32) -> *mut c_void {
+    let ptr = malloc_ext_guest_in(mem, len);
     if ptr.is_null() {
         return ptr::null_mut();
     }
-    guest_host_ptr(ptr.to_bits(), len)
+    guest_host_ptr(mem, ptr.to_bits(), len)
 }
 
-pub fn malloc_ext_guest(len: u32) -> MutVoidPtr {
+pub fn malloc_ext_guest_in(mem: &mut Mem, len: u32) -> MutVoidPtr {
     if len == 0 {
         return MutVoidPtr::null();
     }
     let total = len + size_of::<u32>() as u32;
-    let Some(header_addr) = alloc_guest(real_lg_mem_size(total)) else {
+    let Some(header_addr) = alloc_guest(mem, real_lg_mem_size(total)) else {
         return MutVoidPtr::null();
     };
     let header = MutPtr::<u32>::from_bits(header_addr);
-    bootstrap::with_guest_mem_mut(|mem| mem.write(header, len));
+    mem.write(header, len);
     MutVoidPtr::from_bits(header_addr + size_of::<u32>() as u32)
 }
 
 #[no_mangle]
 pub extern "C" fn my_mallocExt(len: u32) -> *mut c_void {
-    malloc_ext(len)
+    let _ = len;
+    log!("my_mallocExt called without guest memory context");
+    ptr::null_mut()
 }
 
-pub fn malloc_ext_zeroed(len: u32) -> *mut c_void {
-    let ptr = malloc_ext_zeroed_guest(len);
+pub fn malloc_ext_zeroed_in(mem: &mut Mem, len: u32) -> *mut c_void {
+    let ptr = malloc_ext_zeroed_guest_in(mem, len);
     if ptr.is_null() {
         return ptr::null_mut();
     }
-    guest_host_ptr(ptr.to_bits(), len)
+    guest_host_ptr(mem, ptr.to_bits(), len)
 }
 
-pub fn malloc_ext_zeroed_guest(len: u32) -> MutVoidPtr {
-    let ptr = malloc_ext_guest(len);
+pub fn malloc_ext_zeroed_guest_in(mem: &mut Mem, len: u32) -> MutVoidPtr {
+    let ptr = malloc_ext_guest_in(mem, len);
     if !ptr.is_null() {
-        bootstrap::with_guest_mem_mut(|mem| {
-            mem.bytes_at_mut(ptr.cast::<u8>(), len).fill(0);
-        });
+        mem.bytes_at_mut(ptr.cast::<u8>(), len).fill(0);
     }
     ptr
 }
 
 #[no_mangle]
 pub extern "C" fn my_mallocExt0(len: u32) -> *mut c_void {
-    malloc_ext_zeroed(len)
+    let _ = len;
+    log!("my_mallocExt0 called without guest memory context");
+    ptr::null_mut()
 }
 
-pub fn free_ext(p: *mut c_void) {
+pub fn free_ext_in(mem: &mut Mem, p: *mut c_void) {
     if p.is_null() {
         return;
     }
-    let payload = bootstrap::to_mrp_mem_addr(p);
-    free_ext_guest(MutVoidPtr::from_bits(payload));
+    let payload = bootstrap::to_mrp_mem_addr(mem, p);
+    free_ext_guest_in(mem, MutVoidPtr::from_bits(payload));
 }
 
-pub fn free_ext_guest(ptr: MutVoidPtr) {
+pub fn free_ext_guest_in(mem: &mut Mem, ptr: MutVoidPtr) {
     let payload = ptr.to_bits();
     if payload == 0 {
         return;
     }
     let header = MutPtr::<u32>::from_bits(payload - size_of::<u32>() as u32);
-    let _len: u32 = bootstrap::with_guest_mem(|mem| mem.read(header.cast_const()));
-    let _ = free_guest(header.to_bits());
+    let _len: u32 = mem.read(header.cast_const());
+    let _ = free_guest(mem, header.to_bits());
 }
 
 #[no_mangle]
 pub extern "C" fn my_freeExt(p: *mut c_void) {
-    free_ext(p);
+    if !p.is_null() {
+        log!("my_freeExt called without guest memory context");
+    }
 }
 
-pub fn realloc_ext(p: *mut c_void, new_len: u32) -> *mut c_void {
+pub fn realloc_ext_in(mem: &mut Mem, p: *mut c_void, new_len: u32) -> *mut c_void {
     let ptr = if p.is_null() {
         MutVoidPtr::null()
     } else {
-        MutVoidPtr::from_bits(bootstrap::to_mrp_mem_addr(p))
+        MutVoidPtr::from_bits(bootstrap::to_mrp_mem_addr(mem, p))
     };
-    let new_ptr = realloc_ext_guest(ptr, new_len);
+    let new_ptr = realloc_ext_guest_in(mem, ptr, new_len);
     if new_ptr.is_null() {
         return ptr::null_mut();
     }
-    guest_host_ptr(new_ptr.to_bits(), new_len)
+    guest_host_ptr(mem, new_ptr.to_bits(), new_len)
 }
 
-pub fn realloc_ext_guest(ptr: MutVoidPtr, new_len: u32) -> MutVoidPtr {
+pub fn realloc_ext_guest_in(mem: &mut Mem, ptr: MutVoidPtr, new_len: u32) -> MutVoidPtr {
     let payload = ptr.to_bits();
     if ptr.is_null() {
-        return malloc_ext_guest(new_len);
+        return malloc_ext_guest_in(mem, new_len);
     }
     if new_len == 0 {
-        free_ext_guest(ptr);
+        free_ext_guest_in(mem, ptr);
         return MutVoidPtr::null();
     }
     let header = MutPtr::<u32>::from_bits(payload - size_of::<u32>() as u32);
-    let old_len = bootstrap::with_guest_mem(|mem| mem.read(header.cast_const()));
-    let new_block = malloc_ext_guest(new_len);
+    let old_len = mem.read(header.cast_const());
+    let new_block = malloc_ext_guest_in(mem, new_len);
     if new_block.is_null() {
         return new_block;
     }
-    bootstrap::with_guest_mem_mut(|mem| {
-        mem.memmove(
-            new_block,
-            Ptr::<c_void, false>::from_bits(payload),
-            old_len.min(new_len),
-        );
-    });
-    free_ext_guest(ptr);
+    mem.memmove(
+        new_block,
+        Ptr::<c_void, false>::from_bits(payload),
+        old_len.min(new_len),
+    );
+    free_ext_guest_in(mem, ptr);
     new_block
 }
 
 #[no_mangle]
 pub extern "C" fn my_reallocExt(p: *mut c_void, new_len: u32) -> *mut c_void {
-    realloc_ext(p, new_len)
+    let _ = (p, new_len);
+    log!("my_reallocExt called without guest memory context");
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -386,32 +405,38 @@ pub extern "C" fn wstrlen(txt: *mut c_char) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn copyWstrToMrp(str_: *mut c_char) -> u32 {
+    let _ = str_;
+    log!("copyWstrToMrp called without guest memory context");
+    0
+}
+
+pub fn copy_wstr_to_mrp_in(mem: &mut Mem, str_: *mut c_char) -> u32 {
     unsafe {
         if str_.is_null() {
             return 0;
         }
         let len = wstrlen(str_) as usize + 2;
-        let p = malloc_ext(len as u32);
+        let p = malloc_ext_in(mem, len as u32);
         if p.is_null() {
             return 0;
         }
         ptr::copy_nonoverlapping(str_ as *const u8, p as *mut u8, len);
-        bootstrap::to_mrp_mem_addr(p)
+        bootstrap::to_mrp_mem_addr(mem, p)
     }
 }
 
-pub fn copy_str_to_mrp(str_: *mut c_char) -> u32 {
+pub fn copy_str_to_mrp_in(mem: &mut Mem, str_: *mut c_char) -> u32 {
     unsafe {
         if str_.is_null() {
             return 0;
         }
         let len = CStr::from_ptr(str_).to_bytes_with_nul().len();
-        let p = malloc_ext(len as u32);
+        let p = malloc_ext_in(mem, len as u32);
         if p.is_null() {
             return 0;
         }
         ptr::copy_nonoverlapping(str_ as *const u8, p as *mut u8, len);
-        bootstrap::to_mrp_mem_addr(p)
+        bootstrap::to_mrp_mem_addr(mem, p)
     }
 }
 
