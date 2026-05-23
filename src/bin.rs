@@ -1,3 +1,3 @@
 fn main() -> Result<(), String> {
-    skymrp::run_app()
+    skymrp::main(std::env::args())
 }

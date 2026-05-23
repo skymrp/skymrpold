@@ -1,3 +1,4 @@
+#![allow(rustdoc::private_intra_doc_links)]
 #[macro_use]
 mod log;
 mod abi;
@@ -20,10 +21,16 @@ mod window;
 use environment::Environment;
 pub use skymrp_version::*;
 
-pub fn run_app() -> Result<(), String> {
-    log!("Starting bootstrap from Rust...");
+pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
+        echo!(
+        "skymrp {}{}{} — https://skrymrp.org/",
+        branding(),
+        if branding().is_empty() { "" } else { " " },
+        VERSION,
+    );
+    echo!();
 
-    let mythroad_dir = paths::ensure_mythroad_dir()?;
+let mythroad_dir = paths::ensure_mythroad_dir()?;
     let missing = paths::missing_required_system_files();
     if !missing.is_empty() {
         window::show_missing_system_files_message(&mythroad_dir, &missing);
@@ -36,9 +43,7 @@ pub fn run_app() -> Result<(), String> {
     let options = options::Options::default();
     let mut env = Environment::new(options)?;
     env.start()?;
-    env.run()
+    let _ = env.run();
+    Ok(())
 }
 
-pub fn main<T: Iterator<Item = String>>(_args: T) -> Result<(), String> {
-    run_app()
-}
