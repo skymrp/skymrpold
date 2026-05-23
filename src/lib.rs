@@ -22,7 +22,7 @@ use environment::Environment;
 pub use skymrp_version::*;
 
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
-        echo!(
+    echo!(
         "skymrp {}{}{} — https://skrymrp.org/",
         branding(),
         if branding().is_empty() { "" } else { " " },
@@ -30,7 +30,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     );
     echo!();
 
-let mythroad_dir = paths::ensure_mythroad_dir()?;
+    let mythroad_dir = paths::ensure_mythroad_dir()?;
     let missing = paths::missing_required_system_files();
     if !missing.is_empty() {
         window::show_missing_system_files_message(&mythroad_dir, &missing);
@@ -46,4 +46,3 @@ let mythroad_dir = paths::ensure_mythroad_dir()?;
     let _ = env.run();
     Ok(())
 }
-

@@ -6,13 +6,13 @@ use thiserror::Error;
 pub enum Error {
     #[error("The file you parsing is not a mrp file")]
     NotMrpError,
-    
+
     #[error("The file you parsing maybe destroied (cannot ungzip): {0}")]
     GunzipError(String),
-    
+
     #[error("The file you parsing maybe destroied (cannot read information): {0}")]
     ReadInfoError(String),
-    
+
     #[error("The file you parsing maybe destroied (cannot decode to utf8)")]
     Utf8DecodeError,
 
