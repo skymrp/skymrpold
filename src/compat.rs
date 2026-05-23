@@ -2,8 +2,6 @@ use crate::bootstrap;
 use crate::file;
 use crate::mem::{MutPtr, MutVoidPtr, Ptr};
 use libc::{c_char, c_int, c_uchar, c_void, size_t};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,75 +40,12 @@ pub static mut LG_mem_end: *mut c_char = ptr::null_mut();
 #[no_mangle]
 pub static mut LG_mem_left: u32 = 0;
 
-#[derive(Default)]
-struct FreeListAllocator {
-    base: u32,
-    len: u32,
-    free: BTreeMap<u32, u32>,
-    used: BTreeMap<u32, u32>,
-}
-
-impl FreeListAllocator {
-    fn init(&mut self, base: u32, len: u32) {
-        self.base = base;
-        self.len = len;
-        self.free.clear();
-        self.used.clear();
-        self.free.insert(base, len);
-    }
-
-    fn alloc(&mut self, len: u32) -> Option<u32> {
-        let (&base, &chunk_len) = self.free.iter().find(|(_, chunk_len)| **chunk_len >= len)?;
-        self.free.remove(&base);
-        if chunk_len > len {
-            self.free.insert(base + len, chunk_len - len);
-        }
-        self.used.insert(base, len);
-        Some(base)
-    }
-
-    fn free(&mut self, base: u32) -> u32 {
-        let Some(len) = self.used.remove(&base) else {
-            return 0;
-        };
-
-        let mut merged_base = base;
-        let mut merged_len = len;
-
-        if let Some((&prev_base, &prev_len)) = self.free.range(..base).next_back() {
-            if prev_base + prev_len == base {
-                self.free.remove(&prev_base);
-                merged_base = prev_base;
-                merged_len += prev_len;
-            }
-        }
-
-        let next_base = merged_base + merged_len;
-        if let Some(next_len) = self.free.remove(&next_base) {
-            merged_len += next_len;
-        }
-
-        self.free.insert(merged_base, merged_len);
-        len
-    }
-
-    fn realloc(&mut self, old_base: u32, new_len: u32) -> Option<(u32, u32)> {
-        let old_len = self.used.get(&old_base).copied()?;
-        let new_base = self.alloc(new_len)?;
-        Some((new_base, old_len))
-    }
-}
-
-thread_local! {
-    static FREE_LIST: RefCell<FreeListAllocator> = RefCell::new(FreeListAllocator::default());
-}
-
 fn real_lg_mem_size(len: u32) -> u32 {
     len.wrapping_add(7) & 0xfffffff8
 }
 
 fn alloc_guest(len: u32) -> Option<u32> {
-    let addr = FREE_LIST.with(|free_list| free_list.borrow_mut().alloc(len))?;
+    let addr = bootstrap::with_guest_mem_mut(|mem| mem.try_alloc(len).map(|ptr| ptr.to_bits()))?;
     unsafe {
         LG_mem_left = LG_mem_left.saturating_sub(len);
         LG_mem_min = LG_mem_min.min(LG_mem_left);
@@ -120,14 +55,16 @@ fn alloc_guest(len: u32) -> Option<u32> {
     Some(addr)
 }
 
-fn free_guest(addr: u32) {
+fn free_guest(addr: u32) -> u32 {
     if addr == 0 {
-        return;
+        return 0;
     }
-    let freed = FREE_LIST.with(|free_list| free_list.borrow_mut().free(addr));
+    let freed =
+        bootstrap::with_guest_mem_mut(|mem| mem.free_with_size(MutVoidPtr::from_bits(addr)));
     unsafe {
         LG_mem_left = LG_mem_left.saturating_add(freed).min(LG_mem_len);
     }
+    freed
 }
 
 fn guest_host_ptr(addr: u32, count: u32) -> *mut c_void {
@@ -147,11 +84,6 @@ pub fn init_memory_manager(base_address: u32, len: u32) {
         LG_mem_left = LG_mem_len;
         LG_mem_min = LG_mem_len;
         LG_mem_top = 0;
-        FREE_LIST.with(|free_list| {
-            free_list
-                .borrow_mut()
-                .init(bootstrap::to_mrp_mem_addr(LG_mem_base.cast()), LG_mem_len);
-        });
     }
 }
 
@@ -202,7 +134,7 @@ pub extern "C" fn my_free(p: *mut c_void, _len: u32) {
         return;
     }
     let addr = bootstrap::to_mrp_mem_addr(p);
-    free_guest(addr);
+    let _ = free_guest(addr);
 }
 
 #[no_mangle]
@@ -214,21 +146,19 @@ pub extern "C" fn my_realloc(p: *mut c_void, oldlen: u32, len: u32) -> *mut c_vo
         my_free(p, oldlen);
         return ptr::null_mut();
     }
-    let old_addr = bootstrap::to_mrp_mem_addr(p);
     let new_len = real_lg_mem_size(len);
-    let Some((new_addr, old_len)) =
-        FREE_LIST.with(|free_list| free_list.borrow_mut().realloc(old_addr, new_len))
-    else {
+    let Some(new_addr) = alloc_guest(new_len) else {
         return ptr::null_mut();
     };
+    let old_addr = bootstrap::to_mrp_mem_addr(p);
     bootstrap::with_guest_mem_mut(|mem| {
         mem.memmove(
             MutPtr::<c_void>::from_bits(new_addr),
             Ptr::<c_void, false>::from_bits(old_addr),
-            oldlen.min(old_len).min(len),
+            oldlen.min(len),
         );
     });
-    free_guest(old_addr);
+    let _ = free_guest(old_addr);
     guest_host_ptr(new_addr, len)
 }
 
@@ -296,7 +226,7 @@ pub fn free_ext_guest(ptr: MutVoidPtr) {
     }
     let header = MutPtr::<u32>::from_bits(payload - size_of::<u32>() as u32);
     let _len: u32 = bootstrap::with_guest_mem(|mem| mem.read(header.cast_const()));
-    free_guest(header.to_bits());
+    let _ = free_guest(header.to_bits());
 }
 
 #[no_mangle]

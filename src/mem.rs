@@ -264,7 +264,8 @@ pub struct Mem {
     /// range.
     null_segment_size: VAddr,
 
-    allocator: allocator::Allocator,
+    heap_allocator: allocator::HeapAllocator,
+    vm_allocator: allocator::VMAllocator,
 
     /// The flag to control if memory is zeroed out on free (`true`, default)
     /// or on alloc (`false`).
@@ -367,8 +368,8 @@ impl Mem {
         regions: Vec<MemRegion>,
         allocator_base: VAddr,
         allocator_len: GuestUSize,
-        small_alignment: GuestUSize,
-        large_alignment: GuestUSize,
+        _small_alignment: GuestUSize,
+        _large_alignment: GuestUSize,
     ) -> Mem {
         for window in regions.windows(2) {
             let left_end = window[0].guest_base + window[0].len;
@@ -384,17 +385,14 @@ impl Mem {
             "allocator range must be contained in a guest memory region"
         );
 
-        let allocator = allocator::Allocator::new_with_range_and_alignment(
-            allocator_base,
-            allocator_len,
-            small_alignment,
-            large_alignment,
-        );
+        let mut vm_allocator = allocator::VMAllocator::new(allocator_base, allocator_len);
+        let heap_allocator = allocator::HeapAllocator::new(&mut vm_allocator, allocator_len);
 
         Mem {
             regions,
             null_segment_size: 0,
-            allocator,
+            heap_allocator,
+            vm_allocator,
             zero_memory_on_free: true,
         }
     }
@@ -410,8 +408,10 @@ impl Mem {
         //        this, along with removing this special case.
         assert!(self.null_segment_size == 0);
         assert!(new_null_segment_size.is_multiple_of(0x1000));
-        self.allocator
-            .reserve(allocator::Chunk::new(0, new_null_segment_size));
+        let _ = self
+            .vm_allocator
+            .allocate(Some(0), new_null_segment_size)
+            .expect("failed to reserve null segment");
         self.null_segment_size = new_null_segment_size;
     }
 
@@ -676,11 +676,19 @@ impl Mem {
 
     /// Allocate `size` bytes.
     pub fn alloc(&mut self, size: GuestUSize) -> MutVoidPtr {
-        let ptr = Ptr::from_bits(self.allocator.alloc(size));
+        self.try_alloc(size).expect("guest heap allocation failed")
+    }
+
+    pub fn try_alloc(&mut self, size: GuestUSize) -> Option<MutVoidPtr> {
+        let ptr = Ptr::from_bits(
+            self.heap_allocator
+                .alloc(&mut self.vm_allocator, size)?
+                .base(),
+        );
         if !self.zero_memory_on_free {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
         }
-        ptr
+        Some(ptr)
     }
 
     /// Allocate `size` bytes initialized to 0.
@@ -691,7 +699,7 @@ impl Mem {
     }
 
     pub fn malloc_size(&mut self, ptr: ConstVoidPtr) -> GuestUSize {
-        self.allocator.find_allocated_size(ptr.to_bits())
+        self.heap_allocator.find_allocated_size(ptr.to_bits())
     }
 
     pub fn realloc(&mut self, old_ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {
@@ -700,7 +708,7 @@ impl Mem {
         }
         // TODO: for a moment we always assume that we do not have enough size
         //       to realloc inplace
-        let old_size = self.allocator.find_allocated_size(old_ptr.to_bits());
+        let old_size = self.heap_allocator.find_allocated_size(old_ptr.to_bits());
         if old_size >= size {
             return old_ptr;
         }
@@ -712,10 +720,30 @@ impl Mem {
 
     /// Free an allocation made with one of the `alloc` methods on this type.
     pub fn free(&mut self, ptr: MutVoidPtr) {
-        let size = self.allocator.free(ptr.to_bits());
+        self.free_with_size(ptr);
+    }
+
+    /// Free an allocation and return the allocation size.
+    pub fn free_with_size(&mut self, ptr: MutVoidPtr) -> GuestUSize {
+        let size = self
+            .heap_allocator
+            .free(&mut self.vm_allocator, ptr.to_bits());
         if self.zero_memory_on_free {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
         }
+        size
+    }
+
+    pub fn alloc_at(
+        &mut self,
+        addr: VAddr,
+        size: GuestUSize,
+    ) -> Result<(), allocator::VMAllocError> {
+        self.vm_allocator.allocate(Some(addr), size).map(|_| ())
+    }
+
+    pub fn dealloc_at(&mut self, addr: VAddr, size: GuestUSize) {
+        self.vm_allocator.deallocate(addr, size);
     }
 
     /// Allocate memory large enough for a value of type `T` and write the value
@@ -772,6 +800,7 @@ impl Mem {
     /// Permanently mark a region of address space as being unusable to the
     /// memory allocator.
     pub fn reserve(&mut self, base: VAddr, size: GuestUSize) {
-        self.allocator.reserve(allocator::Chunk::new(base, size));
+        self.alloc_at(base, size)
+            .expect("failed to reserve guest memory range");
     }
 }
