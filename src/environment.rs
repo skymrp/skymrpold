@@ -1,7 +1,9 @@
 pub(crate) mod nullable_box;
 use std::time::Instant;
 
-use crate::{bootstrap, cpu, environment::nullable_box::NullableBox, gdb, mem, options, syscall};
+use crate::{
+    bootstrap, cpu, environment::nullable_box::NullableBox, gdb, mem, options, syscall, window,
+};
 
 /// The struct containing the entire emulator state. Methods are provided for
 /// execution and management of threads.
@@ -56,9 +58,9 @@ impl Environment {
     }
 
     /// Run the emulator. This is the main loop and won't return until app exit.
-    /// Only `main.rs` should call this.
-    pub fn run(mut self) {
-        loop {}
+    /// Only the top-level app entry point should call this.
+    pub fn run(&mut self) -> Result<(), String> {
+        window::run(self)
     }
 
     pub fn start(&mut self) -> Result<(), String> {

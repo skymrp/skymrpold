@@ -241,7 +241,7 @@ fn keycode_to_mr(k: Keycode) -> Option<c_int> {
     }
 }
 
-fn show_missing_system_files_message(
+pub(crate) fn show_missing_system_files_message(
     mythroad_dir: &std::path::Path,
     missing: &[std::path::PathBuf],
 ) {
@@ -265,23 +265,8 @@ fn show_missing_system_files_message(
     );
 }
 
-pub fn run() -> Result<(), String> {
-    log!("Starting bootstrap from Rust...");
-
+pub fn run(env: &mut Environment) -> Result<(), String> {
     let sdl_context = sdl2::init()?;
-    let mythroad_dir = paths::ensure_mythroad_dir()?;
-    let missing = paths::missing_required_system_files();
-    if !missing.is_empty() {
-        show_missing_system_files_message(&mythroad_dir, &missing);
-        return Err(format!(
-            "missing required system files in {}",
-            mythroad_dir.display()
-        ));
-    }
-
-    let mut env = Environment::new(crate::options::Options::default())?;
-    env.start()?;
-
     let video_subsystem = sdl_context.video()?;
 
     let window = video_subsystem

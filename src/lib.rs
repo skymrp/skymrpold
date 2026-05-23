@@ -19,13 +19,26 @@ mod window;
 
 use environment::Environment;
 pub use skymrp_version::*;
-pub use window::run as run_app;
 
-pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
-    let mut options = options::Options::default();
-    let mut app_args = None::<Vec<String>>;
-    let _ = args.next().unwrap(); // skip argv[0]
+pub fn run_app() -> Result<(), String> {
+    log!("Starting bootstrap from Rust...");
+
+    let mythroad_dir = paths::ensure_mythroad_dir()?;
+    let missing = paths::missing_required_system_files();
+    if !missing.is_empty() {
+        window::show_missing_system_files_message(&mythroad_dir, &missing);
+        return Err(format!(
+            "missing required system files in {}",
+            mythroad_dir.display()
+        ));
+    }
+
+    let options = options::Options::default();
     let mut env = Environment::new(options)?;
-    env.run();
-    Ok(())
+    env.start()?;
+    env.run()
+}
+
+pub fn main<T: Iterator<Item = String>>(_args: T) -> Result<(), String> {
+    run_app()
 }
