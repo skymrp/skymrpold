@@ -632,6 +632,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mythroad"
+version = "0.1.0"
+dependencies = [
+ "mythroad-sys",
+]
+
+[[package]]
+name = "mythroad-sys"
+version = "0.1.0"
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1046,10 +1057,12 @@ dependencies = [
  "cpal",
  "lazy_static",
  "libc",
+ "mythroad",
  "rustysynth",
  "sdl2",
  "sdl2-sys",
  "skymrp_dynarmic_wrapper",
+ "skymrp_loader",
  "skymrp_version",
  "unicorn-engine",
 ]

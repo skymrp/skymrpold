@@ -6,12 +6,14 @@ pub mod audio;
 mod bootstrap;
 mod compat;
 mod cpu;
+mod direct_mrp;
 mod environment;
 mod file;
 mod gdb;
 mod image;
 mod mem;
 mod mrp;
+mod mythroad_host;
 mod network;
 mod options;
 mod paths;
@@ -29,6 +31,15 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         VERSION,
     );
     echo!();
+
+    let _program_name = args.next();
+    if let Some(mrp_path) = args.find(|arg| {
+        std::path::Path::new(arg)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mrp"))
+    }) {
+        return direct_mrp::run_mrp_file(std::path::Path::new(&mrp_path));
+    }
 
     let mythroad_dir = paths::ensure_mythroad_dir()?;
     let missing = paths::missing_required_system_files();
