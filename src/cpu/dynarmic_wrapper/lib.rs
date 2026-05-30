@@ -1,7 +1,6 @@
 //! This is separated out into its own package so that we can avoid rebuilding
 //! dynarmic more often than necessary, and to improve build-time parallelism.
 
-
 /// Opaque type from C
 #[allow(non_camel_case_types)]
 pub type skymrp_DynarmicWrapper = std::ffi::c_void;
