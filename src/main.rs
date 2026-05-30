@@ -1,3 +1,5 @@
+mod window;
+
 use std::path::PathBuf;
 
 const USAGE: &str = "\
@@ -33,5 +35,18 @@ fn main() -> Result<(), String> {
 
     println!("mrp path is: {}", mrp_path.to_str().unwrap());
 
-    unimplemented!()
+    let mut window = window::Window::new("skymrp");
+    let mut events = Vec::new();
+
+    loop {
+        window.poll_for_events(&mut events);
+        for event in events.drain(..) {
+            match event {
+                window::Event::Quit => {
+                    print!("User requested quit, exiting...");
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
